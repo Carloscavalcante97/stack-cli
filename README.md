@@ -1,44 +1,53 @@
 # Create Stack CLI
 
-Scaffold CLI para acelerar o início de projetos full stack com uma base mais próxima de produção.
+CLI para iniciar projetos full stack com backend e frontend já estruturados para trabalho real.
 
-Tagline: gere projetos com Express, Nest ou FastAPI já com validação, DI, JWT e PostgreSQL opcional.
+O objetivo aqui não é gerar um "hello world bonito". O foco é reduzir tempo de setup sem entregar uma base frágil, acoplada ou difícil de evoluir.
 
-## Por que esse projeto existe
+## O que este projeto resolve
 
-Começar um projeto do zero quase sempre custa tempo demais em tarefas repetidas:
+Quando um projeto começa do zero, o custo inicial quase sempre cai nas mesmas tarefas:
 
-- organizar estrutura inicial
-- configurar backend e frontend
-- ligar validação
+- definir estrutura de pastas
+- configurar ambiente e workspace
+- ligar validação e tratamento de erro
 - preparar autenticação
-- decidir convenções mínimas
+- organizar persistência inicial
 - subir infraestrutura local
+- alinhar uma base mínima de arquitetura
 
-O objetivo do `create-stack-cli` é reduzir esse tempo e entregar uma base limpa, genérica e reutilizável para quem quer começar rápido sem abrir mão de uma arquitetura sólida.
+O `create-stack-cli` existe para transformar isso em um ponto de partida consistente, especialmente para:
 
-## O que ele gera
+- projetos pessoais sérios
+- protótipos que podem virar produto
+- estudos com padrão profissional
+- demos técnicas
+- times pequenos que querem acelerar o dia zero
+
+## O que o CLI entrega hoje
 
 ### Backend
 
-Escolha entre:
+Você pode gerar:
 
 - `NestJS`
 - `Express`
 - `FastAPI`
 - `none`
 
-Todos os backends gerados saem com:
+Os backends gerados saem com base arquitetural organizada, autenticação inicial e endpoints úteis desde o começo.
 
-- organização em camadas inspirada em clean architecture
-- validação de entrada
+Dependendo da stack, o scaffold inclui:
+
+- validação de payload
+- tratamento de erro
 - JWT para autenticação
 - rota protegida inicial
 - health check
-- DI configurada na stack
-- PostgreSQL opcional
+- DI / composition root
+- persistência em memória ou PostgreSQL
 
-### ORM e persistência
+### Persistência
 
 Quando `postgres` é selecionado:
 
@@ -48,11 +57,11 @@ Quando `postgres` é selecionado:
 
 Quando `none` é selecionado:
 
-- o scaffold usa um repositório em memória para continuar funcional
+- o scaffold permanece funcional com repositório em memória
 
 ### Frontend
 
-Escolha entre:
+Você pode gerar:
 
 - `Next.js`
 - `Vite + React`
@@ -60,19 +69,66 @@ Escolha entre:
 
 O frontend sai com:
 
-- shell visual inicial
-- env centralizado
-- estrutura pronta para conectar API
-- base genérica para evoluir autenticação e design system depois
+- estrutura inicial de app
+- variáveis de ambiente organizadas
+- ponto claro para integração com API
+- base visual inicial para continuar o produto
 
 ### Infra local
 
-Opcionalmente:
+Opcionalmente, o projeto pode sair com:
 
 - `PostgreSQL` via Docker Compose
 - `Redis` via Docker Compose
 
-## Estrutura que o CLI cria
+## O que diferencia este CLI de um scaffold raso
+
+- não tenta vender arquitetura só pelo nome das pastas
+- já parte de separação de responsabilidades e wiring inicial
+- não vem preso a um contexto corporativo específico
+- gera código com foco em evolução, não só em demonstração
+- reduz retrabalho no primeiro dia sem esconder complexidade real
+
+## Como instalar e usar localmente
+
+### 1. Instalar dependências do próprio CLI
+
+```bash
+pnpm install
+pnpm build
+```
+
+### 2. Expor o binário localmente
+
+```bash
+pnpm link --global
+hash -r
+```
+
+### 3. Executar o CLI
+
+```bash
+create-stack
+```
+
+O CLI pergunta por:
+
+- nome do projeto
+- backend
+- frontend
+- persistência inicial
+- uso de Husky
+- Docker Compose
+- PostgreSQL local
+- Redis local
+
+## Exemplo de uso
+
+```bash
+create-stack
+```
+
+Exemplo de resultado:
 
 ```txt
 apps/
@@ -83,63 +139,135 @@ infra/
 packages/
 ```
 
-No backend, a base segue este desenho:
+## Estrutura arquitetural gerada
 
-```txt
-src/
-  domain/
-  application/
-  infra/
-  presentation/
-  shared/
-```
+### Express
 
-## Exemplo de fluxo
+Base com:
 
-```bash
-pnpm install
-pnpm build
-node dist/index.js
-```
+- `domain`
+- `application`
+- `infra`
+- `presentation`
 
-Durante a execução, o CLI pergunta:
+Composição HTTP explícita, sem controller resolvendo dependência direto no container.
 
-- nome do projeto
-- backend desejado
-- frontend desejado
-- persistência inicial
-- uso de Husky
-- Docker Compose
-- PostgreSQL local
-- Redis local
+### Nest
 
-## Exemplo do que já nasce pronto
+Base com:
 
-### Express / Nest / FastAPI
+- módulos por feature
+- providers de segurança e persistência separados
+- filtro global para erro de aplicação
+- testes iniciais de smoke
 
-Endpoints iniciais:
+### FastAPI
 
-- `GET /api/health`
+Base com:
+
+- `bootstrap`
+- `application`
+- `domain`
+- `infra`
+- `presentation`
+- `tests`
+
+Com `create_app()`, container, dependencies por request e health split entre `live` e `ready`.
+
+## Endpoints iniciais
+
+Os templates de backend saem com um conjunto mínimo de rotas úteis:
+
+- `GET /api/health` para `Express` e `Nest`
+- `GET /api/health/live` para `FastAPI`
+- `GET /api/health/ready` para `FastAPI`
 - `POST /api/auth/register`
 - `POST /api/auth/login`
 - `GET /api/users/me`
 
-### Frontend
+## Fluxo após gerar um projeto
 
-Variáveis iniciais:
+O CLI já imprime os próximos passos no terminal, mas o caminho padrão é:
 
-- `NEXT_PUBLIC_API_URL` ou `VITE_API_URL`
-- `NEXT_PUBLIC_DATA_LAYER` ou `VITE_DATA_LAYER`
+```bash
+cd ~/projects/<nome-do-projeto>
+pnpm install
+```
 
-## Diferenciais do projeto
+Depois:
 
-- evita scaffold extremamente raso
-- não está preso a um contexto de empresa específico
-- serve como base genérica para portfólio, estudo e projetos reais
-- acelera onboarding de times pequenos
-- reduz o tempo até a primeira feature útil
+### Backend Node
 
-## Stack usada no CLI
+```bash
+cp apps/backend/.env.example apps/backend/.env
+pnpm --filter @apps/backend dev
+```
+
+Se o projeto usar PostgreSQL:
+
+```bash
+pnpm --filter @apps/backend db:generate
+pnpm --filter @apps/backend db:migrate
+pnpm --filter @apps/backend dev
+```
+
+### Backend FastAPI
+
+```bash
+cd apps/backend
+cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+make test
+uvicorn app.main:app --reload --port 3001
+```
+
+### Infra local
+
+Se o projeto foi gerado com Docker:
+
+```bash
+cp infra/docker/.env.example infra/docker/.env
+docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d
+```
+
+## Para quem este projeto é
+
+Este repositório é especialmente útil para quem quer:
+
+- começar rápido sem abrir mão de uma base organizada
+- publicar projetos com aparência de engenharia real
+- evitar copiar sempre o mesmo boilerplate manualmente
+- experimentar stacks diferentes mantendo um padrão de entrada
+
+## O que ele não tenta fazer
+
+Este CLI não tenta:
+
+- substituir decisões profundas de domínio
+- gerar um produto final
+- adivinhar as regras do seu negócio
+- impor uma arquitetura única para todos os casos
+
+Ele resolve o setup inicial com um padrão forte e deixa espaço para o projeto crescer de forma consciente.
+
+## Estado atual
+
+Hoje o projeto já é adequado para:
+
+- publicação no GitHub
+- demonstração pública
+- uso como base para novos projetos
+
+Evoluções naturais que ainda fazem sentido:
+
+- CI inicial por stack
+- mais testes gerados
+- variantes assíncronas no FastAPI
+- módulos mais ricos por contexto de domínio
+
+## Stack do próprio CLI
 
 - `TypeScript`
 - `tsx`
@@ -147,22 +275,6 @@ Variáveis iniciais:
 - `chalk`
 - `ora`
 
-## Como posicionar esse projeto
+## Licença
 
-Você pode apresentar o `create-stack-cli` como:
-
-- um scaffold full stack com foco em velocidade + base de engenharia
-- uma CLI para iniciar APIs com arquitetura organizada desde o dia zero
-- uma ferramenta para reduzir tempo perdido com setup repetitivo
-
-## Roadmap sugerido
-
-- adicionar testes base por stack
-- gerar módulos por contexto de domínio
-- oferecer opção de lint por app
-- gerar CI inicial para GitHub Actions
-- criar templates de documentação por projeto
-
-## Status
-
-O projeto está pronto para demonstração pública e publicação no GitHub/LinkedIn como uma ferramenta de produtividade para início de projetos.
+MIT
