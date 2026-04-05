@@ -10,14 +10,12 @@ function createFiles(baseDir: string, files: Record<string, string>) {
 }
 
 function getBackendEnvExample(answers: Answers) {
-  const backendDataLayer = usesPostgres(answers) ? 'postgres' : 'memory'
   const lines = [
     'PORT=3001',
     'GLOBAL_PREFIX=api',
     'NODE_ENV=development',
     'APP_NAME=Create Stack API',
     'CORS_ORIGIN=http://localhost:3000,http://localhost:5173',
-    `DATA_LAYER=${backendDataLayer}`,
     'JWT_ACCESS_SECRET=change-this-secret-with-at-least-32-characters',
     'JWT_ACCESS_EXPIRES_IN=1d',
   ]
@@ -41,6 +39,10 @@ function getBackendReadme(
   const sections = [
     `# ${title}`,
     '',
+    '## Importante',
+    '- Copie `.env.example` para `.env` antes de rodar o backend.',
+    `- ${usesPostgres(answers) ? 'Se PostgreSQL estiver habilitado, suba o banco antes do `dev`.' : 'Revise o `.env` antes do primeiro `dev`.'}`,
+    '',
     'Estrutura inicial pronta para produção com:',
     '- Clean architecture (`domain`, `application`, `infra`, `presentation`)',
     '- Validação de payload e de ambiente',
@@ -63,7 +65,29 @@ function getBackendReadme(
   ]
 
   if (usesPostgres(answers)) {
-    sections.push('- Execute a migração/generate do ORM antes de subir a aplicação.')
+    sections.push('- Garanta que o PostgreSQL esteja disponível em `DATABASE_URL` antes de subir a aplicação.')
+
+    if (answers.useDocker && answers.provisionPostgres) {
+      sections.push('- Se você escolheu Docker no scaffold, suba a infra com `docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d`.')
+    }
+  }
+
+  if (answers.useDocker && (answers.provisionPostgres || answers.useRedis)) {
+    sections.push(
+      '',
+      '## Infra local',
+      'Para subir PostgreSQL e Redis a partir de `apps/backend`, use:',
+      '',
+      '```bash',
+      'docker compose -f ../../infra/docker/docker-compose.yml --env-file ../../infra/docker/.env up -d',
+      '```',
+      '',
+      'Para derrubar a infraestrutura:',
+      '',
+      '```bash',
+      'docker compose -f ../../infra/docker/docker-compose.yml down',
+      '```',
+    )
   }
 
   sections.push(
@@ -75,30 +99,37 @@ function getBackendReadme(
   return `${sections.join('\n')}\n`
 }
 
-function getRuntimeConfigTs(framework: 'express' | 'nestjs') {
+function getRuntimeConfigTs(
+  framework: 'express' | 'nestjs',
+  withPostgres: boolean,
+) {
   return `export const runtimeConfig = {
   framework: '${framework}',
   authStrategy: 'jwt',
+  persistence: '${withPostgres ? 'postgres' : 'memory'}',
+  orm: '${withPostgres ? 'prisma' : 'memory'}',
 } as const
 `
 }
 
-function getRuntimeConfigPy() {
+function getRuntimeConfigPy(withPostgres: boolean) {
   return `RUNTIME_CONFIG = {
     'framework': 'fastapi',
     'auth_strategy': 'jwt',
+    'persistence': '${withPostgres ? 'postgres' : 'memory'}',
+    'orm': '${withPostgres ? 'sqlalchemy' : 'memory'}',
 }
 `
 }
 
 function getPrismaSchema() {
   return `generator client {
-  provider = 'prisma-client-js'
+  provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = 'postgresql'
-  url      = env('DATABASE_URL')
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -106,7 +137,6 @@ model User {
   name         String
   email        String   @unique
   passwordHash String
-  dataLayer    String
   createdAt    DateTime @default(now())
 }
 `
@@ -124,8 +154,10 @@ export function createExpress(projectDir: string, answers: Answers) {
       dev: 'tsx watch src/main.ts',
       build: 'tsc -p tsconfig.json',
       start: 'node dist/main.js',
+      test: 'tsx --test src/**/*.test.ts',
       ...(withPostgres
         ? {
+            postinstall: 'prisma generate',
             'db:generate': 'prisma generate',
             'db:migrate': 'prisma migrate dev',
           }
@@ -184,13 +216,17 @@ export function createExpress(projectDir: string, answers: Answers) {
 
   createFiles(backendDir, {
     '.env.example': getBackendEnvExample(answers),
-    'src/shared/config/runtime.ts': getRuntimeConfigTs('express'),
+    'src/shared/config/runtime.ts': getRuntimeConfigTs('express', withPostgres),
     'src/main.ts': `import 'reflect-metadata'
 import 'dotenv/config'
 import { createApp } from './app.js'
-import { env } from './shared/config/env.js'
+import { buildHttpDependencies } from './infra/container/build-http-dependencies.js'
+import { assertEnvFileExists, loadEnv } from './shared/config/env.js'
 
-const app = createApp()
+assertEnvFileExists()
+const env = loadEnv()
+const dependencies = buildHttpDependencies(env)
+const app = createApp(env, dependencies.router)
 
 app.listen(env.PORT, () => {
   console.log(
@@ -198,16 +234,14 @@ app.listen(env.PORT, () => {
   )
 })
 `,
-    'src/app.ts': `import express from 'express'
+    'src/app.ts': `import express, { type Router } from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import pinoHttp from 'pino-http'
-import './infra/container/index.js'
-import { apiRouter } from './presentation/http/routes/index.js'
 import { errorHandler } from './presentation/http/middlewares/error-handler.js'
-import { env } from './shared/config/env.js'
+import type { AppEnv } from './shared/config/env.js'
 
-export function createApp() {
+export function createApp(env: AppEnv, apiRouter: Router) {
   const app = express()
 
   app.disable('x-powered-by')
@@ -233,7 +267,8 @@ export function createApp() {
   return app
 }
 `,
-    'src/shared/config/env.ts': `import { z } from 'zod'
+    'src/shared/config/env.ts': `import fs from 'node:fs'
+import { z } from 'zod'
 
 const envSchema = z
   .object({
@@ -245,7 +280,6 @@ const envSchema = z
       .string()
       .default('http://localhost:3000,http://localhost:5173')
       .transform((value) => value.split(',').map((item) => item.trim()).filter(Boolean)),
-    DATA_LAYER: z.enum(['memory', 'postgres']).default('${withPostgres ? 'postgres' : 'memory'}'),
     DATABASE_URL: z.string().optional(),
     JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.'),
     JWT_ACCESS_EXPIRES_IN: z.string().min(2).default('1d'),
@@ -260,15 +294,28 @@ const envSchema = z
     }
   })
 
-const parsedEnv = envSchema.safeParse(process.env)
+export type AppEnv = z.infer<typeof envSchema>
 
-if (!parsedEnv.success) {
-  console.error('Falha ao validar variáveis de ambiente do backend Express.')
-  console.error(parsedEnv.error.flatten().fieldErrors)
-  process.exit(1)
+export function assertEnvFileExists() {
+  if (!fs.existsSync('.env')) {
+    throw new Error(
+      'Arquivo .env não encontrado. Copie .env.example para .env antes de rodar o backend.',
+    )
+  }
 }
 
-export const env = parsedEnv.data
+export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
+  const parsedEnv = envSchema.safeParse(source)
+
+  if (!parsedEnv.success) {
+    throw new Error(
+      'Falha ao validar variáveis de ambiente do backend Express: ' +
+        JSON.stringify(parsedEnv.error.flatten().fieldErrors),
+    )
+  }
+
+  return parsedEnv.data
+}
 `,
     'src/shared/errors/app-error.ts': `export class AppError extends Error {
   constructor(
@@ -297,7 +344,6 @@ export const env = parsedEnv.data
     public readonly email: string,
     public readonly passwordHash: string,
     public readonly createdAt: string,
-    public readonly dataLayer: string,
   ) {}
 }
 `,
@@ -347,7 +393,6 @@ export abstract class TokenServiceContract {
     name: string
     email: string
     createdAt: string
-    dataLayer: string
   }
 }
 `,
@@ -385,7 +430,6 @@ export class RegisterUserUseCase {
       name: user.name,
       email: user.email,
       createdAt: user.createdAt,
-      dataLayer: user.dataLayer,
     }
   }
 }
@@ -437,7 +481,6 @@ export class LoginUseCase {
         name: user.name,
         email: user.email,
         createdAt: user.createdAt,
-        dataLayer: user.dataLayer,
       },
     }
   }
@@ -466,7 +509,6 @@ export class GetCurrentUserUseCase {
       name: user.name,
       email: user.email,
       createdAt: user.createdAt,
-      dataLayer: user.dataLayer,
     }
   }
 }
@@ -487,22 +529,26 @@ export class BcryptPasswordHasher implements PasswordHasherContract {
 }
 `,
     'src/infra/security/jwt-token.service.ts': `import { jwtVerify, SignJWT } from 'jose'
-import { injectable } from 'tsyringe'
 import type { AccessTokenPayload } from '../../application/security/contracts/token-service.contract.js'
 import { TokenServiceContract } from '../../application/security/contracts/token-service.contract.js'
 import { AppError } from '../../shared/errors/app-error.js'
-import { env } from '../../shared/config/env.js'
+import type { AppEnv } from '../../shared/config/env.js'
 
-@injectable()
 export class JwtTokenService implements TokenServiceContract {
-  private readonly secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
+  private readonly secret: Uint8Array
+
+  constructor(
+    private readonly env: Pick<AppEnv, 'JWT_ACCESS_SECRET' | 'JWT_ACCESS_EXPIRES_IN'>,
+  ) {
+    this.secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
+  }
 
   async signAccessToken(payload: AccessTokenPayload) {
     return new SignJWT({ email: payload.email })
       .setProtectedHeader({ alg: 'HS256' })
       .setSubject(payload.sub)
       .setIssuedAt()
-      .setExpirationTime(env.JWT_ACCESS_EXPIRES_IN)
+      .setExpirationTime(this.env.JWT_ACCESS_EXPIRES_IN)
       .sign(this.secret)
   }
 
@@ -527,7 +573,6 @@ export class JwtTokenService implements TokenServiceContract {
     'src/infra/repositories/in-memory-user.repository.ts': `import { injectable } from 'tsyringe'
 import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 import { UserEntity } from '../../domain/users/entities/user.entity.js'
-import { env } from '../../shared/config/env.js'
 
 @injectable()
 export class InMemoryUserRepository implements UserRepositoryContract {
@@ -540,7 +585,6 @@ export class InMemoryUserRepository implements UserRepositoryContract {
       input.email,
       input.passwordHash,
       new Date().toISOString(),
-      env.DATA_LAYER,
     )
 
     InMemoryUserRepository.users.set(user.id, user)
@@ -579,7 +623,6 @@ if (process.env.NODE_ENV !== 'production') {
 import { prisma } from '../database/prisma/client.js'
 import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 import { UserEntity } from '../../domain/users/entities/user.entity.js'
-import { env } from '../../shared/config/env.js'
 
 @injectable()
 export class PrismaUserRepository implements UserRepositoryContract {
@@ -589,7 +632,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
         name: input.name,
         email: input.email,
         passwordHash: input.passwordHash,
-        dataLayer: env.DATA_LAYER,
       },
     })
 
@@ -599,7 +641,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 
@@ -613,7 +654,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 
@@ -627,14 +667,14 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 }
 `,
         }
       : {}),
-    'src/infra/container/index.ts': `import { container } from 'tsyringe'
+    'src/infra/container/build-http-dependencies.ts': `import { Router } from 'express'
+import { container, type DependencyContainer } from 'tsyringe'
 import { LoginUseCase } from '../../application/auth/use-cases/login.use-case.js'
 import { PasswordHasherContract } from '../../application/security/contracts/password-hasher.contract.js'
 import { TokenServiceContract } from '../../application/security/contracts/token-service.contract.js'
@@ -643,23 +683,58 @@ import { RegisterUserUseCase } from '../../application/users/use-cases/register-
 import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 import { BcryptPasswordHasher } from '../security/bcrypt-password-hasher.js'
 import { JwtTokenService } from '../security/jwt-token.service.js'
+import type { AppEnv } from '../../shared/config/env.js'
+import { AuthController } from '../../presentation/http/controllers/auth.controller.js'
+import { HealthController } from '../../presentation/http/controllers/health.controller.js'
+import { UsersController } from '../../presentation/http/controllers/users.controller.js'
+import { createAuthMiddleware } from '../../presentation/http/middlewares/auth-middleware.js'
+import { createApiRouter } from '../../presentation/http/routes/index.js'
 ${withPostgres ? "import { PrismaUserRepository } from '../repositories/prisma-user.repository.js'" : "import { InMemoryUserRepository } from '../repositories/in-memory-user.repository.js'"}
 
-container.registerSingleton(RegisterUserUseCase, RegisterUserUseCase)
-container.registerSingleton(LoginUseCase, LoginUseCase)
-container.registerSingleton(GetCurrentUserUseCase, GetCurrentUserUseCase)
-container.registerSingleton<PasswordHasherContract>(
-  'PasswordHasherContract',
-  BcryptPasswordHasher,
-)
-container.registerSingleton<TokenServiceContract>(
-  'TokenServiceContract',
-  JwtTokenService,
-)
-container.registerSingleton<UserRepositoryContract>(
-  'UserRepositoryContract',
-  ${withPostgres ? 'PrismaUserRepository' : 'InMemoryUserRepository'},
-)
+function buildContainer(env: AppEnv): DependencyContainer {
+  const scopedContainer = container.createChildContainer()
+
+  scopedContainer.registerSingleton(RegisterUserUseCase, RegisterUserUseCase)
+  scopedContainer.registerSingleton(LoginUseCase, LoginUseCase)
+  scopedContainer.registerSingleton(GetCurrentUserUseCase, GetCurrentUserUseCase)
+  scopedContainer.registerSingleton<PasswordHasherContract>(
+    'PasswordHasherContract',
+    BcryptPasswordHasher,
+  )
+  scopedContainer.register<TokenServiceContract>('TokenServiceContract', {
+    useValue: new JwtTokenService(env),
+  })
+  scopedContainer.registerSingleton<UserRepositoryContract>(
+    'UserRepositoryContract',
+    ${withPostgres ? 'PrismaUserRepository' : 'InMemoryUserRepository'},
+  )
+
+  return scopedContainer
+}
+
+export function buildHttpDependencies(env: AppEnv): { router: Router } {
+  const scopedContainer = buildContainer(env)
+  const authController = new AuthController(
+    scopedContainer.resolve(RegisterUserUseCase),
+    scopedContainer.resolve(LoginUseCase),
+  )
+  const usersController = new UsersController(
+    scopedContainer.resolve(GetCurrentUserUseCase),
+  )
+  const healthController = new HealthController()
+  const authMiddleware = createAuthMiddleware(
+    scopedContainer.resolve<TokenServiceContract>('TokenServiceContract'),
+  )
+
+  return {
+    router: createApiRouter({
+      authController,
+      usersController,
+      healthController,
+      authMiddleware,
+    }),
+  }
+}
 `,
     'src/presentation/http/schemas/register-user.schema.ts': `import { z } from 'zod'
 
@@ -741,32 +816,31 @@ export function asyncHandler(handler: RequestHandler) {
 }
 `,
     'src/presentation/http/middlewares/auth-middleware.ts': `import type { NextFunction, Request, Response } from 'express'
-import { container } from 'tsyringe'
 import { TokenServiceContract } from '../../../application/security/contracts/token-service.contract.js'
 import { AppError } from '../../../shared/errors/app-error.js'
 
-export async function authMiddleware(
-  req: Request,
-  _res: Response,
-  next: NextFunction,
-) {
-  const authorization = req.headers.authorization
+export function createAuthMiddleware(tokenService: TokenServiceContract) {
+  return async function authMiddleware(
+    req: Request,
+    _res: Response,
+    next: NextFunction,
+  ) {
+    const authorization = req.headers.authorization
 
-  if (!authorization?.startsWith('Bearer ')) {
-    next(new AppError('Token ausente.', 401, 'MISSING_TOKEN'))
-    return
+    if (!authorization?.startsWith('Bearer ')) {
+      next(new AppError('Token ausente.', 401, 'MISSING_TOKEN'))
+      return
+    }
+
+    const token = authorization.replace('Bearer ', '').trim()
+    const payload = await tokenService.verifyAccessToken(token)
+
+    req.auth = { userId: payload.sub }
+    next()
   }
-
-  const token = authorization.replace('Bearer ', '').trim()
-  const tokenService = container.resolve<TokenServiceContract>('TokenServiceContract')
-  const payload = await tokenService.verifyAccessToken(token)
-
-  req.auth = { userId: payload.sub }
-  next()
 }
 `,
     'src/presentation/http/controllers/health.controller.ts': `import type { Request, Response } from 'express'
-import { env } from '../../../shared/config/env.js'
 import { runtimeConfig } from '../../../shared/config/runtime.js'
 
 export class HealthController {
@@ -775,73 +849,89 @@ export class HealthController {
       status: 'ok',
       framework: runtimeConfig.framework,
       authStrategy: runtimeConfig.authStrategy,
-      dataLayer: env.DATA_LAYER,
-      orm: '${withPostgres ? 'prisma' : 'memory'}',
+      persistence: runtimeConfig.persistence,
+      orm: runtimeConfig.orm,
       timestamp: new Date().toISOString(),
     })
   }
 }
 `,
     'src/presentation/http/controllers/auth.controller.ts': `import type { Request, Response } from 'express'
-import { container } from 'tsyringe'
 import { LoginUseCase } from '../../../application/auth/use-cases/login.use-case.js'
 import { RegisterUserUseCase } from '../../../application/users/use-cases/register-user.use-case.js'
 
 export class AuthController {
+  constructor(
+    private readonly registerUserUseCase: RegisterUserUseCase,
+    private readonly loginUseCase: LoginUseCase,
+  ) {}
+
   async register(req: Request, res: Response) {
-    const useCase = container.resolve(RegisterUserUseCase)
-    const result = await useCase.execute(req.body)
+    const result = await this.registerUserUseCase.execute(req.body)
     return res.status(201).json(result)
   }
 
   async login(req: Request, res: Response) {
-    const useCase = container.resolve(LoginUseCase)
-    const result = await useCase.execute(req.body)
+    const result = await this.loginUseCase.execute(req.body)
     return res.status(200).json(result)
   }
 }
 `,
     'src/presentation/http/controllers/users.controller.ts': `import type { Request, Response } from 'express'
-import { container } from 'tsyringe'
 import { GetCurrentUserUseCase } from '../../../application/users/use-cases/get-current-user.use-case.js'
 
 export class UsersController {
+  constructor(private readonly getCurrentUserUseCase: GetCurrentUserUseCase) {}
+
   async me(req: Request, res: Response) {
-    const useCase = container.resolve(GetCurrentUserUseCase)
-    const result = await useCase.execute(req.auth!.userId)
+    const result = await this.getCurrentUserUseCase.execute(req.auth!.userId)
     return res.status(200).json(result)
   }
 }
 `,
-    'src/presentation/http/routes/index.ts': `import { Router } from 'express'
+    'src/presentation/http/routes/index.ts': `import { Router, type RequestHandler } from 'express'
 import { AuthController } from '../controllers/auth.controller.js'
 import { HealthController } from '../controllers/health.controller.js'
 import { UsersController } from '../controllers/users.controller.js'
 import { asyncHandler } from '../middlewares/async-handler.js'
-import { authMiddleware } from '../middlewares/auth-middleware.js'
 import { validateRequest } from '../middlewares/validate-request.js'
 import { loginSchema } from '../schemas/login.schema.js'
 import { registerUserSchema } from '../schemas/register-user.schema.js'
 
-const router = Router()
-const healthController = new HealthController()
-const authController = new AuthController()
-const usersController = new UsersController()
+type CreateApiRouterInput = {
+  authController: AuthController
+  usersController: UsersController
+  healthController: HealthController
+  authMiddleware: RequestHandler
+}
 
-router.get('/health', (req, res) => healthController.handle(req, res))
-router.post(
-  '/auth/register',
-  validateRequest(registerUserSchema),
-  asyncHandler((req, res) => authController.register(req, res)),
-)
-router.post(
-  '/auth/login',
-  validateRequest(loginSchema),
-  asyncHandler((req, res) => authController.login(req, res)),
-)
-router.get('/users/me', asyncHandler(authMiddleware), asyncHandler((req, res) => usersController.me(req, res)))
+export function createApiRouter({
+  authController,
+  usersController,
+  healthController,
+  authMiddleware,
+}: CreateApiRouterInput) {
+  const router = Router()
 
-export { router as apiRouter }
+  router.get('/health', (req, res) => healthController.handle(req, res))
+  router.post(
+    '/auth/register',
+    validateRequest(registerUserSchema),
+    asyncHandler((req, res) => authController.register(req, res)),
+  )
+  router.post(
+    '/auth/login',
+    validateRequest(loginSchema),
+    asyncHandler((req, res) => authController.login(req, res)),
+  )
+  router.get(
+    '/users/me',
+    asyncHandler(authMiddleware),
+    asyncHandler((req, res) => usersController.me(req, res)),
+  )
+
+  return router
+}
 `,
     'README.md': getBackendReadme(
       'Backend Express',
@@ -871,8 +961,10 @@ export function createNest(projectDir: string, answers: Answers) {
       dev: 'tsx watch src/main.ts',
       build: 'tsc -p tsconfig.json',
       start: 'node dist/main.js',
+      test: 'tsx --test src/**/*.test.ts',
       ...(withPostgres
         ? {
+            postinstall: 'prisma generate',
             'db:generate': 'prisma generate',
             'db:migrate': 'prisma migrate dev',
           }
@@ -893,8 +985,13 @@ export function createNest(projectDir: string, answers: Answers) {
       ...(withPostgres ? { '@prisma/client': '^6.4.1' } : {}),
     },
     devDependencies: {
+      '@nestjs/testing': '^11.0.3',
+      '@types/bcryptjs': '^2.4.6',
+      '@types/express': '^5.0.0',
       '@types/node': '^22.10.2',
-      prisma: '^6.4.1',
+      '@types/supertest': '^6.0.3',
+      ...(withPostgres ? { prisma: '^6.4.1' } : {}),
+      supertest: '^7.1.0',
       tsx: '^4.19.2',
       typescript: '^5.7.2',
     },
@@ -927,18 +1024,13 @@ export function createNest(projectDir: string, answers: Answers) {
 
   createFiles(backendDir, {
     '.env.example': getBackendEnvExample(answers),
-    'src/shared/config/runtime.ts': getRuntimeConfigTs('nestjs'),
-    'src/main.ts': `import 'reflect-metadata'
-import 'dotenv/config'
-import helmet from 'helmet'
-import { ValidationPipe } from '@nestjs/common'
-import { NestFactory } from '@nestjs/core'
-import { AppModule } from './app.module.js'
-import { env } from './shared/config/env.js'
+    'src/shared/config/runtime.ts': getRuntimeConfigTs('nestjs', withPostgres),
+    'src/bootstrap/configure-app.ts': `import helmet from 'helmet'
+import { ValidationPipe, type INestApplication } from '@nestjs/common'
+import { AppExceptionFilter } from '../presentation/http/filters/app-exception.filter.js'
+import type { Env } from '../shared/config/env.js'
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule)
-
+export function configureApp(app: INestApplication, env: Env) {
   app.use(helmet())
   app.enableCors({
     origin: env.corsOrigin,
@@ -952,6 +1044,22 @@ async function bootstrap() {
       transform: true,
     }),
   )
+  app.useGlobalFilters(new AppExceptionFilter())
+
+  return app
+}
+`,
+    'src/main.ts': `import 'reflect-metadata'
+import 'dotenv/config'
+import { NestFactory } from '@nestjs/core'
+import { AppModule } from './app.module.js'
+import { configureApp } from './bootstrap/configure-app.js'
+import { loadEnv } from './shared/config/env.js'
+
+async function bootstrap() {
+  const env = loadEnv()
+  const app = await NestFactory.create(AppModule)
+  configureApp(app, env)
 
   await app.listen(env.port)
 
@@ -960,15 +1068,12 @@ async function bootstrap() {
 
 bootstrap()
 `,
-    'src/shared/config/env.ts': `type DataLayer = 'memory' | 'postgres'
-
-type Env = {
+    'src/shared/config/env.ts': `export type Env = {
   port: number
   globalPrefix: string
   nodeEnv: 'development' | 'test' | 'production'
   appName: string
   corsOrigin: string[]
-  dataLayer: DataLayer
   databaseUrl?: string
   jwtAccessSecret: string
   jwtAccessExpiresIn: string
@@ -980,51 +1085,53 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
-function parseDataLayer(value: string | undefined): DataLayer {
-  const dataLayer = value ?? '${withPostgres ? 'postgres' : 'memory'}'
-  assert(['memory', 'postgres'].includes(dataLayer), 'DATA_LAYER inválido.')
-  return dataLayer as DataLayer
-}
-
-function validateEnv(): Env {
-  const dataLayer = parseDataLayer(process.env.DATA_LAYER)
-  const port = Number(process.env.PORT ?? 3001)
-  const jwtAccessSecret = process.env.JWT_ACCESS_SECRET ?? ''
+export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  const port = Number(source.PORT ?? 3001)
+  const jwtAccessSecret =
+    source.JWT_ACCESS_SECRET ?? 'change-this-secret-with-at-least-32-characters'
 
   assert(Number.isFinite(port) && port > 0, 'PORT deve ser um número válido.')
   assert(jwtAccessSecret.length >= 32, 'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.')
 
-  const databaseUrl = process.env.DATABASE_URL
+  const databaseUrl = source.DATABASE_URL
   if (${withPostgres} && !databaseUrl) {
     throw new Error('DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')
   }
 
   return {
     port,
-    globalPrefix: process.env.GLOBAL_PREFIX ?? 'api',
-    nodeEnv: (process.env.NODE_ENV as Env['nodeEnv']) ?? 'development',
-    appName: process.env.APP_NAME ?? 'Create Stack API',
-    corsOrigin: (process.env.CORS_ORIGIN ?? 'http://localhost:3000,http://localhost:5173')
+    globalPrefix: source.GLOBAL_PREFIX ?? 'api',
+    nodeEnv: (source.NODE_ENV as Env['nodeEnv']) ?? 'development',
+    appName: source.APP_NAME ?? 'Create Stack API',
+    corsOrigin: (source.CORS_ORIGIN ?? 'http://localhost:3000,http://localhost:5173')
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean),
-    dataLayer,
     databaseUrl,
     jwtAccessSecret,
-    jwtAccessExpiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? '1d',
+    jwtAccessExpiresIn: source.JWT_ACCESS_EXPIRES_IN ?? '1d',
   }
 }
-
-export const env = validateEnv()
+`,
+    'src/shared/errors/app-error.ts': `export class AppError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode = 400,
+    public readonly code = 'APPLICATION_ERROR',
+    public readonly details?: unknown,
+  ) {
+    super(message)
+    this.name = 'AppError'
+  }
+}
 `,
     'src/app.module.ts': `import { Module } from '@nestjs/common'
-import { ApplicationCoreModule } from './infra/modules/application-core.module.js'
-import { AuthHttpModule } from './presentation/http/modules/auth/auth-http.module.js'
-import { HealthHttpModule } from './presentation/http/modules/health/health-http.module.js'
-import { UsersHttpModule } from './presentation/http/modules/users/users-http.module.js'
+import { AuthModule } from './modules/auth/auth.module.js'
+import { HealthModule } from './modules/health/health.module.js'
+import { UsersModule } from './modules/users/users.module.js'
 
 @Module({
-  imports: [ApplicationCoreModule, HealthHttpModule, AuthHttpModule, UsersHttpModule],
+  imports: [HealthModule, AuthModule, UsersModule],
 })
 export class AppModule {}
 `,
@@ -1035,7 +1142,6 @@ export class AppModule {}
     public readonly email: string,
     public readonly passwordHash: string,
     public readonly createdAt: string,
-    public readonly dataLayer: string,
   ) {}
 }
 `,
@@ -1100,7 +1206,6 @@ export class RegisterUserUseCase {
       name: user.name,
       email: user.email,
       createdAt: user.createdAt,
-      dataLayer: user.dataLayer,
     }
   }
 }
@@ -1150,7 +1255,6 @@ export class LoginUseCase {
         name: user.name,
         email: user.email,
         createdAt: user.createdAt,
-        dataLayer: user.dataLayer,
       },
     }
   }
@@ -1179,7 +1283,6 @@ export class GetCurrentUserUseCase {
       name: user.name,
       email: user.email,
       createdAt: user.createdAt,
-      dataLayer: user.dataLayer,
     }
   }
 }
@@ -1203,19 +1306,20 @@ export class BcryptPasswordHasher implements PasswordHasherContract {
 import { jwtVerify, SignJWT } from 'jose'
 import type { AccessTokenPayload } from '../../application/security/contracts/token-service.contract.js'
 import { TokenServiceContract } from '../../application/security/contracts/token-service.contract.js'
-import { env } from '../../shared/config/env.js'
+import { loadEnv } from '../../shared/config/env.js'
 import { AppError } from '../../shared/errors/app-error.js'
 
 @Injectable()
 export class JwtTokenService implements TokenServiceContract {
-  private readonly secret = new TextEncoder().encode(env.jwtAccessSecret)
+  private readonly env = loadEnv()
+  private readonly secret = new TextEncoder().encode(this.env.jwtAccessSecret)
 
   async signAccessToken(payload: AccessTokenPayload) {
     return new SignJWT({ email: payload.email })
       .setProtectedHeader({ alg: 'HS256' })
       .setSubject(payload.sub)
       .setIssuedAt()
-      .setExpirationTime(env.jwtAccessExpiresIn)
+      .setExpirationTime(this.env.jwtAccessExpiresIn)
       .sign(this.secret)
   }
 
@@ -1240,7 +1344,6 @@ export class JwtTokenService implements TokenServiceContract {
     'src/infra/repositories/in-memory-user.repository.ts': `import { Injectable } from '@nestjs/common'
 import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 import { UserEntity } from '../../domain/users/entities/user.entity.js'
-import { env } from '../../shared/config/env.js'
 
 @Injectable()
 export class InMemoryUserRepository implements UserRepositoryContract {
@@ -1253,7 +1356,6 @@ export class InMemoryUserRepository implements UserRepositoryContract {
       input.email,
       input.passwordHash,
       new Date().toISOString(),
-      env.dataLayer,
     )
 
     InMemoryUserRepository.users.set(user.id, user)
@@ -1292,7 +1394,6 @@ if (process.env.NODE_ENV !== 'production') {
 import { prisma } from '../database/prisma/client.js'
 import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 import { UserEntity } from '../../domain/users/entities/user.entity.js'
-import { env } from '../../shared/config/env.js'
 
 @Injectable()
 export class PrismaUserRepository implements UserRepositoryContract {
@@ -1302,7 +1403,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
         name: input.name,
         email: input.email,
         passwordHash: input.passwordHash,
-        dataLayer: env.dataLayer,
       },
     })
 
@@ -1312,7 +1412,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 
@@ -1326,7 +1425,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 
@@ -1340,26 +1438,35 @@ export class PrismaUserRepository implements UserRepositoryContract {
       user.email,
       user.passwordHash,
       user.createdAt.toISOString(),
-      user.dataLayer,
     )
   }
 }
 `,
         }
       : {}),
-    'src/infra/modules/application-core.module.ts': `import { Module } from '@nestjs/common'
-import { LoginUseCase } from '../../application/auth/use-cases/login.use-case.js'
-import { GetCurrentUserUseCase } from '../../application/users/use-cases/get-current-user.use-case.js'
-import { RegisterUserUseCase } from '../../application/users/use-cases/register-user.use-case.js'
-import { BcryptPasswordHasher } from '../security/bcrypt-password-hasher.js'
-import { JwtTokenService } from '../security/jwt-token.service.js'
+    'src/infra/modules/persistence.module.ts': `import { Module } from '@nestjs/common'
+import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 ${withPostgres ? "import { PrismaUserRepository } from '../repositories/prisma-user.repository.js'" : "import { InMemoryUserRepository } from '../repositories/in-memory-user.repository.js'"}
 
 @Module({
   providers: [
-    RegisterUserUseCase,
-    LoginUseCase,
-    GetCurrentUserUseCase,
+    {
+      provide: 'UserRepositoryContract',
+      useClass: ${withPostgres ? 'PrismaUserRepository' : 'InMemoryUserRepository'},
+    },
+  ],
+  exports: ['UserRepositoryContract'],
+})
+export class PersistenceModule {}
+`,
+    'src/infra/modules/security.module.ts': `import { Module } from '@nestjs/common'
+import { PasswordHasherContract } from '../../application/security/contracts/password-hasher.contract.js'
+import { TokenServiceContract } from '../../application/security/contracts/token-service.contract.js'
+import { BcryptPasswordHasher } from '../security/bcrypt-password-hasher.js'
+import { JwtTokenService } from '../security/jwt-token.service.js'
+
+@Module({
+  providers: [
     BcryptPasswordHasher,
     JwtTokenService,
     {
@@ -1370,21 +1477,10 @@ ${withPostgres ? "import { PrismaUserRepository } from '../repositories/prisma-u
       provide: 'TokenServiceContract',
       useExisting: JwtTokenService,
     },
-    {
-      provide: 'UserRepositoryContract',
-      useClass: ${withPostgres ? 'PrismaUserRepository' : 'InMemoryUserRepository'},
-    },
   ],
-  exports: [
-    RegisterUserUseCase,
-    LoginUseCase,
-    GetCurrentUserUseCase,
-    'PasswordHasherContract',
-    'TokenServiceContract',
-    'UserRepositoryContract',
-  ],
+  exports: ['PasswordHasherContract', 'TokenServiceContract'],
 })
-export class ApplicationCoreModule {}
+export class SecurityModule {}
 `,
     'src/presentation/http/dto/register-user.dto.ts': `import { IsEmail, IsString, MinLength } from 'class-validator'
 
@@ -1410,6 +1506,26 @@ export class LoginDto {
   @IsString()
   @MinLength(8)
   password!: string
+}
+`,
+    'src/presentation/http/filters/app-exception.filter.ts': `import { ArgumentsHost, Catch, ExceptionFilter } from '@nestjs/common'
+import type { Response } from 'express'
+import { AppError } from '../../../shared/errors/app-error.js'
+
+@Catch(AppError)
+export class AppExceptionFilter implements ExceptionFilter<AppError> {
+  catch(exception: AppError, host: ArgumentsHost) {
+    const response = host.switchToHttp().getResponse<Response>()
+
+    response.status(exception.statusCode).json({
+      type: 'about:blank',
+      title: exception.code,
+      status: exception.statusCode,
+      code: exception.code,
+      detail: exception.message,
+      details: exception.details,
+    })
+  }
 }
 `,
     'src/presentation/http/guards/jwt-auth.guard.ts': `import { CanActivate, ExecutionContext, Inject, Injectable } from '@nestjs/common'
@@ -1441,7 +1557,6 @@ export class JwtAuthGuard implements CanActivate {
 }
 `,
     'src/presentation/http/controllers/health.controller.ts': `import { Controller, Get } from '@nestjs/common'
-import { env } from '../../../shared/config/env.js'
 import { runtimeConfig } from '../../../shared/config/runtime.js'
 
 @Controller('health')
@@ -1452,12 +1567,48 @@ export class HealthController {
       status: 'ok',
       framework: runtimeConfig.framework,
       authStrategy: runtimeConfig.authStrategy,
-      dataLayer: env.dataLayer,
-      orm: '${withPostgres ? 'prisma' : 'memory'}',
+      persistence: runtimeConfig.persistence,
+      orm: runtimeConfig.orm,
       timestamp: new Date().toISOString(),
     }
   }
 }
+`,
+    'src/modules/health/health.module.ts': `import { Module } from '@nestjs/common'
+import { HealthController } from '../../presentation/http/controllers/health.controller.js'
+
+@Module({
+  controllers: [HealthController],
+})
+export class HealthModule {}
+`,
+    'src/modules/auth/auth.module.ts': `import { Module } from '@nestjs/common'
+import { LoginUseCase } from '../../application/auth/use-cases/login.use-case.js'
+import { RegisterUserUseCase } from '../../application/users/use-cases/register-user.use-case.js'
+import { PersistenceModule } from '../../infra/modules/persistence.module.js'
+import { SecurityModule } from '../../infra/modules/security.module.js'
+import { AuthController } from '../../presentation/http/controllers/auth.controller.js'
+
+@Module({
+  imports: [PersistenceModule, SecurityModule],
+  controllers: [AuthController],
+  providers: [RegisterUserUseCase, LoginUseCase],
+})
+export class AuthModule {}
+`,
+    'src/modules/users/users.module.ts': `import { Module } from '@nestjs/common'
+import { GetCurrentUserUseCase } from '../../application/users/use-cases/get-current-user.use-case.js'
+import { PersistenceModule } from '../../infra/modules/persistence.module.js'
+import { SecurityModule } from '../../infra/modules/security.module.js'
+import { UsersController } from '../../presentation/http/controllers/users.controller.js'
+import { JwtAuthGuard } from '../../presentation/http/guards/jwt-auth.guard.js'
+
+@Module({
+  imports: [PersistenceModule, SecurityModule],
+  controllers: [UsersController],
+  providers: [GetCurrentUserUseCase, JwtAuthGuard],
+})
+export class UsersModule {}
 `,
     'src/presentation/http/controllers/auth.controller.ts': `import { Body, Controller, Post } from '@nestjs/common'
 import { LoginUseCase } from '../../../application/auth/use-cases/login.use-case.js'
@@ -1499,35 +1650,47 @@ export class UsersController {
   }
 }
 `,
-    'src/presentation/http/modules/health/health-http.module.ts': `import { Module } from '@nestjs/common'
-import { HealthController } from '../../controllers/health.controller.js'
+    'src/health.e2e.test.ts': `import assert from 'node:assert/strict'
+import { after, before, describe, it } from 'node:test'
+import type { INestApplication } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import request from 'supertest'
+import { configureApp } from './bootstrap/configure-app.js'
+import { AppModule } from './app.module.js'
+import { loadEnv } from './shared/config/env.js'
 
-@Module({
-  controllers: [HealthController],
-})
-export class HealthHttpModule {}
-`,
-    'src/presentation/http/modules/auth/auth-http.module.ts': `import { Module } from '@nestjs/common'
-import { ApplicationCoreModule } from '../../../../infra/modules/application-core.module.js'
-import { AuthController } from '../../controllers/auth.controller.js'
+describe('Health', () => {
+  let app: INestApplication
 
-@Module({
-  imports: [ApplicationCoreModule],
-  controllers: [AuthController],
-})
-export class AuthHttpModule {}
-`,
-    'src/presentation/http/modules/users/users-http.module.ts': `import { Module } from '@nestjs/common'
-import { ApplicationCoreModule } from '../../../../infra/modules/application-core.module.js'
-import { UsersController } from '../../controllers/users.controller.js'
-import { JwtAuthGuard } from '../../guards/jwt-auth.guard.js'
+  before(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile()
 
-@Module({
-  imports: [ApplicationCoreModule],
-  controllers: [UsersController],
-  providers: [JwtAuthGuard],
+    app = moduleRef.createNestApplication()
+    configureApp(
+      app,
+      loadEnv({
+        ...process.env,
+        ${withPostgres ? "DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/app_db'," : ''}
+        JWT_ACCESS_SECRET:
+          process.env.JWT_ACCESS_SECRET ?? 'change-this-secret-with-at-least-32-characters',
+      }),
+    )
+    await app.init()
+  })
+
+  after(async () => {
+    await app.close()
+  })
+
+  it('GET /api/health returns ok', async () => {
+    const response = await request(app.getHttpServer()).get('/api/health')
+
+    assert.equal(response.status, 200)
+    assert.equal(response.body.status, 'ok')
+  })
 })
-export class UsersHttpModule {}
 `,
     'README.md': getBackendReadme(
       'Backend NestJS',
@@ -1538,6 +1701,7 @@ export class UsersHttpModule {}
         'cp .env.example .env',
         'pnpm install',
         ...(withPostgres ? ['pnpm db:generate', 'pnpm db:migrate'] : []),
+        'pnpm test',
         'pnpm dev',
         '```',
       ],
@@ -1548,6 +1712,19 @@ export class UsersHttpModule {}
 export function createFastApi(projectDir: string, answers: Answers) {
   const backendDir = path.join(projectDir, 'apps', 'backend')
   const withPostgres = usesPostgres(answers)
+  const fastApiEnvExample = [
+    'PORT=3001',
+    'API_PREFIX=api',
+    'ENVIRONMENT=development',
+    'APP_NAME=Create Stack API',
+    'CORS_ORIGINS=http://localhost:3000,http://localhost:5173',
+    'LOG_LEVEL=INFO',
+    'JWT_ACCESS_SECRET=change-this-secret-with-at-least-32-characters',
+    'JWT_ACCESS_EXPIRES_MINUTES=1440',
+    ...(withPostgres
+      ? ['DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app_db']
+      : []),
+  ].join('\n')
 
   writeFile(
     path.join(backendDir, 'requirements.txt'),
@@ -1563,123 +1740,276 @@ export function createFastApi(projectDir: string, answers: Answers) {
     ].join('\n')}\n`,
   )
 
+  writeFile(
+    path.join(backendDir, 'requirements-dev.txt'),
+    `${[
+      '-r requirements.txt',
+      'pytest',
+      'pytest-cov',
+      'httpx',
+      'ruff',
+      'mypy',
+    ].join('\n')}\n`,
+  )
+
   createFiles(backendDir, {
-    '.env.example': getBackendEnvExample(answers),
+    '.env.example': `${fastApiEnvExample}\n`,
+    'pyproject.toml': `[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+`,
+    'Makefile': `.PHONY: dev test lint format typecheck
+
+dev:
+\tuvicorn app.main:app --reload --port 3001
+
+test:
+\tpytest
+
+lint:
+\truff check .
+
+format:
+\truff format .
+
+typecheck:
+\tmypy app
+`,
     'app/__init__.py': '',
-    'app/application/__init__.py': '',
-    'app/application/auth/__init__.py': '',
-    'app/application/auth/use_cases/__init__.py': '',
-    'app/application/security/__init__.py': '',
-    'app/application/users/__init__.py': '',
-    'app/application/users/use_cases/__init__.py': '',
-    'app/domain/__init__.py': '',
-    'app/domain/users/__init__.py': '',
-    'app/domain/users/contracts/__init__.py': '',
-    'app/domain/users/entities/__init__.py': '',
-    'app/infra/__init__.py': '',
-    'app/infra/repositories/__init__.py': '',
-    'app/presentation/__init__.py': '',
-    'app/presentation/http/__init__.py': '',
-    'app/presentation/http/routes/__init__.py': '',
-    'app/shared/__init__.py': '',
-    'app/shared/config/__init__.py': '',
-    'app/shared/config/runtime.py': getRuntimeConfigPy(),
-    'app/main.py': `from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+    'app/main.py': `from app.bootstrap.app_factory import create_app
 
-from app.presentation.http.errors import register_exception_handlers
-from app.presentation.http.routes.auth import router as auth_router
-from app.presentation.http.routes.health import router as health_router
-from app.presentation.http.routes.users import router as users_router
-from app.shared.config.settings import settings
-${withPostgres ? "from app.infra.database import Base, engine\nfrom app.infra.models.user_model import UserModel\n" : ''}
-
-app = FastAPI(title=settings.app_name)
-register_exception_handlers(app)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=['*'],
-    allow_headers=['*'],
-)
-${withPostgres ? 'Base.metadata.create_all(bind=engine)\n' : ''}
-app.include_router(health_router, prefix='/' + settings.global_prefix)
-app.include_router(auth_router, prefix='/' + settings.global_prefix)
-app.include_router(users_router, prefix='/' + settings.global_prefix)
+app = create_app()
 `,
-    'app/shared/config/settings.py': `from pydantic import model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+    'app/bootstrap/__init__.py': '',
+    'app/bootstrap/runtime.py': getRuntimeConfigPy(withPostgres),
+    'app/bootstrap/logging.py': `import logging
 
 
-class Settings(BaseSettings):
-    port: int = 3001
-    global_prefix: str = 'api'
-    node_env: str = 'development'
-    app_name: str = 'Create Stack API'
-    cors_origin: str = 'http://localhost:3000,http://localhost:5173'
-    data_layer: str = '${withPostgres ? 'postgres' : 'memory'}'
-    database_url: str | None = None
-    jwt_access_secret: str = 'change-this-secret-with-at-least-32-characters'
-    jwt_access_expires_in: str = '1d'
-
-    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
-
-    @property
-    def cors_origin_list(self) -> list[str]:
-        return [item.strip() for item in self.cors_origin.split(',') if item.strip()]
-
-    @model_validator(mode='after')
-    def validate_dependencies(self):
-        if ${withPostgres} and not self.database_url:
-            raise ValueError('DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')
-
-        if len(self.jwt_access_secret) < 32:
-            raise ValueError('JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.')
-
-        return self
-
-
-settings = Settings()
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level.upper(),
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+    )
 `,
-    'app/shared/errors/app_error.py': `class AppError(Exception):
-    def __init__(self, message: str, status_code: int = 400, code: str = 'APPLICATION_ERROR', details=None):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-        self.code = code
-        self.details = details
+    'app/bootstrap/lifespan.py': `from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.bootstrap.container import AppContainer
+
+
+def create_lifespan(container: AppContainer):
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        container.shutdown()
+
+    return lifespan
 `,
-    'app/domain/users/entities/user_entity.py': `from dataclasses import dataclass
+    'app/bootstrap/container.py': `from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from app.application.auth.use_cases.login import LoginUseCase
+from app.application.security.password_hasher_contract import PasswordHasherContract
+from app.application.security.token_service_contract import TokenServiceContract
+from app.application.users.use_cases.get_current_user import GetCurrentUserUseCase
+from app.application.users.use_cases.register_user import RegisterUserUseCase
+from app.domain.users.contracts.user_repository import UserRepositoryContract
+from app.infra.config.settings import Settings
+${withPostgres ? "from app.infra.database.session import create_database_runtime\nfrom app.infra.observability.readiness import MemoryReadinessProbe, SqlAlchemyReadinessProbe\nfrom app.infra.repositories.sqlalchemy.user_repository import SqlAlchemyUserRepository" : "from app.infra.observability.readiness import MemoryReadinessProbe\nfrom app.infra.repositories.memory.user_repository import InMemoryUserRepository"}
+from app.infra.security.jwt_token_service import JwtTokenService
+from app.infra.security.password_hasher import BcryptPasswordHasher
 
 
 @dataclass(slots=True)
-class UserEntity:
-    id: str
-    name: str
+class AppContainer:
+    settings: Settings
+    password_hasher: PasswordHasherContract
+    token_service: TokenServiceContract
+    readiness_probe: Any
+    session_factory: Any = None
+    engine: Any = None
+
+    def build_user_repository(self, db_session: Any | None = None) -> UserRepositoryContract:
+        if self.settings.data_layer == 'postgres':
+            if db_session is None:
+                raise RuntimeError('Uma sessão de banco é obrigatória quando data_layer=postgres.')
+            return SqlAlchemyUserRepository(db_session)
+        return InMemoryUserRepository()
+
+    def build_register_user_use_case(self, db_session: Any | None = None) -> RegisterUserUseCase:
+        return RegisterUserUseCase(
+            self.build_user_repository(db_session),
+            self.password_hasher,
+        )
+
+    def build_login_use_case(self, db_session: Any | None = None) -> LoginUseCase:
+        return LoginUseCase(
+            self.build_user_repository(db_session),
+            self.password_hasher,
+            self.token_service,
+        )
+
+    def build_get_current_user_use_case(self, db_session: Any | None = None) -> GetCurrentUserUseCase:
+        return GetCurrentUserUseCase(self.build_user_repository(db_session))
+
+    def shutdown(self) -> None:
+        if self.engine is not None:
+            self.engine.dispose()
+
+
+def build_container(settings: Settings) -> AppContainer:
+    password_hasher = BcryptPasswordHasher()
+    token_service = JwtTokenService(settings)
+
+${withPostgres ? `    engine, session_factory = create_database_runtime(settings)
+    readiness_probe = SqlAlchemyReadinessProbe(session_factory)
+    return AppContainer(
+        settings=settings,
+        password_hasher=password_hasher,
+        token_service=token_service,
+        readiness_probe=readiness_probe,
+        session_factory=session_factory,
+        engine=engine,
+    )` : `    readiness_probe = MemoryReadinessProbe()
+    return AppContainer(
+        settings=settings,
+        password_hasher=password_hasher,
+        token_service=token_service,
+        readiness_probe=readiness_probe,
+    )`}
+`,
+    'app/bootstrap/app_factory.py': `from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.bootstrap.container import build_container
+from app.bootstrap.lifespan import create_lifespan
+from app.bootstrap.logging import configure_logging
+from app.infra.config.settings import get_settings
+from app.presentation.http.api import router as api_router
+from app.presentation.http.errors.handlers import register_exception_handlers
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    container = build_container(settings)
+
+    app = FastAPI(
+        title=settings.app_name,
+        lifespan=create_lifespan(container),
+    )
+    app.state.container = container
+    register_exception_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=True,
+        allow_methods=['*'],
+        allow_headers=['*'],
+    )
+    app.include_router(api_router, prefix='/' + settings.api_prefix)
+    return app
+`,
+    'app/application/__init__.py': '',
+    'app/application/auth/__init__.py': '',
+    'app/application/auth/dto/__init__.py': '',
+    'app/application/auth/dto/login_command.py': `from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class LoginCommand:
     email: str
-    password_hash: str
-    created_at: str
-    data_layer: str
+    password: str
 `,
-    'app/domain/users/contracts/user_repository_contract.py': `from abc import ABC, abstractmethod
+    'app/application/auth/dto/auth_result.py': `from dataclasses import dataclass
 
-from app.domain.users.entities.user_entity import UserEntity
+from app.application.users.dto.user_result import UserResult
 
 
-class UserRepositoryContract(ABC):
+@dataclass(slots=True)
+class AuthResult:
+    access_token: str
+    user: UserResult
+`,
+    'app/application/auth/use_cases/__init__.py': '',
+    'app/application/auth/use_cases/login.py': `from app.application.auth.dto.auth_result import AuthResult
+from app.application.auth.dto.login_command import LoginCommand
+from app.application.security.password_hasher_contract import PasswordHasherContract
+from app.application.security.token_service_contract import TokenServiceContract
+from app.application.users.dto.user_result import UserResult
+from app.domain.users.contracts.user_repository import UserRepositoryContract
+from app.shared.errors.app_error import AppError
+
+
+class LoginUseCase:
+    def __init__(
+        self,
+        user_repository: UserRepositoryContract,
+        password_hasher: PasswordHasherContract,
+        token_service: TokenServiceContract,
+    ):
+        self.user_repository = user_repository
+        self.password_hasher = password_hasher
+        self.token_service = token_service
+
+    def execute(self, command: LoginCommand) -> AuthResult:
+        user = self.user_repository.find_by_email(command.email)
+        if not user:
+            raise AppError('Credenciais inválidas.', status_code=401, code='INVALID_CREDENTIALS')
+
+        is_password_valid = self.password_hasher.compare(command.password, user.password_hash)
+        if not is_password_valid:
+            raise AppError('Credenciais inválidas.', status_code=401, code='INVALID_CREDENTIALS')
+
+        access_token = self.token_service.sign_access_token(
+            {
+                'sub': user.id,
+                'email': user.email,
+            },
+        )
+
+        return AuthResult(
+            access_token=access_token,
+            user=UserResult(
+                id=user.id,
+                name=user.name,
+                email=user.email,
+                created_at=user.created_at,
+            ),
+        )
+`,
+    'app/application/common/__init__.py': '',
+    'app/application/common/contracts/__init__.py': '',
+    'app/application/common/contracts/unit_of_work.py': `from abc import ABC, abstractmethod
+
+
+class UnitOfWorkContract(ABC):
     @abstractmethod
-    def create(self, payload: dict[str, str]) -> UserEntity:
+    def commit(self) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def find_by_email(self, email: str) -> UserEntity | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def find_by_id(self, user_id: str) -> UserEntity | None:
+    def rollback(self) -> None:
         raise NotImplementedError
 `,
+    'app/application/security/__init__.py': '',
     'app/application/security/password_hasher_contract.py': `from abc import ABC, abstractmethod
 
 
@@ -1704,39 +2034,32 @@ class TokenServiceContract(ABC):
     def verify_access_token(self, token: str) -> dict[str, str]:
         raise NotImplementedError
 `,
-    'app/application/users/schemas.py': `from pydantic import BaseModel, EmailStr, Field
+    'app/application/users/__init__.py': '',
+    'app/application/users/dto/__init__.py': '',
+    'app/application/users/dto/register_user_command.py': `from dataclasses import dataclass
 
 
-class RegisterUserInput(BaseModel):
-    name: str = Field(min_length=3)
-    email: EmailStr
-    password: str = Field(min_length=8)
+@dataclass(slots=True)
+class RegisterUserCommand:
+    name: str
+    email: str
+    password: str
+`,
+    'app/application/users/dto/user_result.py': `from dataclasses import dataclass
 
 
-class UserOutput(BaseModel):
+@dataclass(slots=True)
+class UserResult:
     id: str
     name: str
-    email: EmailStr
+    email: str
     created_at: str
-    data_layer: str
 `,
-    'app/application/auth/schemas.py': `from pydantic import BaseModel, EmailStr, Field
-
-from app.application.users.schemas import UserOutput
-
-
-class LoginInput(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8)
-
-
-class AuthOutput(BaseModel):
-    access_token: str
-    user: UserOutput
-`,
-    'app/application/users/use_cases/register_user_use_case.py': `from app.application.security.password_hasher_contract import PasswordHasherContract
-from app.application.users.schemas import RegisterUserInput, UserOutput
-from app.domain.users.contracts.user_repository_contract import UserRepositoryContract
+    'app/application/users/use_cases/__init__.py': '',
+    'app/application/users/use_cases/register_user.py': `from app.application.security.password_hasher_contract import PasswordHasherContract
+from app.application.users.dto.register_user_command import RegisterUserCommand
+from app.application.users.dto.user_result import UserResult
+from app.domain.users.contracts.user_repository import UserRepositoryContract
 from app.shared.errors.app_error import AppError
 
 
@@ -1749,76 +2072,27 @@ class RegisterUserUseCase:
         self.user_repository = user_repository
         self.password_hasher = password_hasher
 
-    def execute(self, payload: RegisterUserInput) -> UserOutput:
-        existing_user = self.user_repository.find_by_email(payload.email)
+    def execute(self, command: RegisterUserCommand) -> UserResult:
+        existing_user = self.user_repository.find_by_email(command.email)
         if existing_user:
             raise AppError('E-mail já cadastrado.', status_code=409, code='EMAIL_ALREADY_EXISTS')
 
-        password_hash = self.password_hasher.hash(payload.password)
+        password_hash = self.password_hasher.hash(command.password)
         user = self.user_repository.create(
-            {
-                'name': payload.name,
-                'email': str(payload.email),
-                'password_hash': password_hash,
-            },
+            name=command.name,
+            email=command.email,
+            password_hash=password_hash,
         )
 
-        return UserOutput(
+        return UserResult(
             id=user.id,
             name=user.name,
             email=user.email,
             created_at=user.created_at,
-            data_layer=user.data_layer,
         )
 `,
-    'app/application/auth/use_cases/login_use_case.py': `from app.application.auth.schemas import AuthOutput, LoginInput
-from app.application.security.password_hasher_contract import PasswordHasherContract
-from app.application.security.token_service_contract import TokenServiceContract
-from app.application.users.schemas import UserOutput
-from app.domain.users.contracts.user_repository_contract import UserRepositoryContract
-from app.shared.errors.app_error import AppError
-
-
-class LoginUseCase:
-    def __init__(
-        self,
-        user_repository: UserRepositoryContract,
-        password_hasher: PasswordHasherContract,
-        token_service: TokenServiceContract,
-    ):
-        self.user_repository = user_repository
-        self.password_hasher = password_hasher
-        self.token_service = token_service
-
-    def execute(self, payload: LoginInput) -> AuthOutput:
-        user = self.user_repository.find_by_email(str(payload.email))
-        if not user:
-            raise AppError('Credenciais inválidas.', status_code=401, code='INVALID_CREDENTIALS')
-
-        is_password_valid = self.password_hasher.compare(payload.password, user.password_hash)
-        if not is_password_valid:
-            raise AppError('Credenciais inválidas.', status_code=401, code='INVALID_CREDENTIALS')
-
-        access_token = self.token_service.sign_access_token(
-            {
-                'sub': user.id,
-                'email': user.email,
-            },
-        )
-
-        return AuthOutput(
-            access_token=access_token,
-            user=UserOutput(
-                id=user.id,
-                name=user.name,
-                email=user.email,
-                created_at=user.created_at,
-                data_layer=user.data_layer,
-            ),
-        )
-`,
-    'app/application/users/use_cases/get_current_user_use_case.py': `from app.application.users.schemas import UserOutput
-from app.domain.users.contracts.user_repository_contract import UserRepositoryContract
+    'app/application/users/use_cases/get_current_user.py': `from app.application.users.dto.user_result import UserResult
+from app.domain.users.contracts.user_repository import UserRepositoryContract
 from app.shared.errors.app_error import AppError
 
 
@@ -1826,20 +2100,293 @@ class GetCurrentUserUseCase:
     def __init__(self, user_repository: UserRepositoryContract):
         self.user_repository = user_repository
 
-    def execute(self, user_id: str) -> UserOutput:
+    def execute(self, user_id: str) -> UserResult:
         user = self.user_repository.find_by_id(user_id)
         if not user:
             raise AppError('Usuário não encontrado.', status_code=404, code='USER_NOT_FOUND')
 
-        return UserOutput(
+        return UserResult(
             id=user.id,
             name=user.name,
             email=user.email,
             created_at=user.created_at,
-            data_layer=user.data_layer,
         )
 `,
-    'app/infra/security/bcrypt_password_hasher.py': `from passlib.context import CryptContext
+    'app/domain/__init__.py': '',
+    'app/domain/users/__init__.py': '',
+    'app/domain/users/contracts/__init__.py': '',
+    'app/domain/users/contracts/user_repository.py': `from abc import ABC, abstractmethod
+
+from app.domain.users.entities.user import UserEntity
+
+
+class UserRepositoryContract(ABC):
+    @abstractmethod
+    def create(self, *, name: str, email: str, password_hash: str) -> UserEntity:
+        raise NotImplementedError
+
+    @abstractmethod
+    def find_by_email(self, email: str) -> UserEntity | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def find_by_id(self, user_id: str) -> UserEntity | None:
+        raise NotImplementedError
+`,
+    'app/domain/users/entities/__init__.py': '',
+    'app/domain/users/entities/user.py': `from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class UserEntity:
+    id: str
+    name: str
+    email: str
+    password_hash: str
+    created_at: str
+`,
+    'app/domain/users/value_objects/__init__.py': '',
+    'app/domain/users/value_objects/email.py': `from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Email:
+    value: str
+
+    def __post_init__(self):
+        if '@' not in self.value:
+            raise ValueError('E-mail inválido.')
+`,
+    'app/infra/__init__.py': '',
+    'app/infra/config/__init__.py': '',
+    'app/infra/config/settings.py': `from functools import lru_cache
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    app_name: str = 'Create Stack API'
+    environment: str = 'development'
+    api_prefix: str = 'api'
+    port: int = 3001
+    log_level: str = 'INFO'
+    cors_origins: str = 'http://localhost:3000,http://localhost:5173'
+    data_layer: str = '${withPostgres ? 'postgres' : 'memory'}'
+    auth_strategy: str = 'jwt'
+    database_url: str | None = None
+    jwt_access_secret: str = 'change-this-secret-with-at-least-32-characters'
+    jwt_access_expires_minutes: int = 1440
+
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
+    @field_validator('log_level')
+    @classmethod
+    def validate_log_level(cls, value: str) -> str:
+        allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+        normalized = value.upper()
+        if normalized not in allowed:
+            raise ValueError('LOG_LEVEL inválido.')
+        return normalized
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [item.strip() for item in self.cors_origins.split(',') if item.strip()]
+
+    @model_validator(mode='after')
+    def validate_dependencies(self):
+        if self.data_layer not in {'memory', 'postgres'}:
+            raise ValueError('DATA_LAYER inválido.')
+
+        if ${withPostgres ? 'True' : 'False'} and not self.database_url:
+            raise ValueError('DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')
+
+        if len(self.jwt_access_secret) < 32:
+            raise ValueError('JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.')
+
+        if self.jwt_access_expires_minutes <= 0:
+            raise ValueError('JWT_ACCESS_EXPIRES_MINUTES deve ser maior que zero.')
+
+        return self
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+`,
+    ...(withPostgres
+      ? {
+          'app/infra/database/__init__.py': '',
+          'app/infra/database/base.py': `from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+`,
+          'app/infra/database/session.py': `from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.infra.config.settings import Settings
+
+
+def normalize_database_url(database_url: str) -> str:
+    if database_url.startswith('postgresql://'):
+        return database_url.replace('postgresql://', 'postgresql+psycopg://', 1)
+    return database_url
+
+
+def create_database_runtime(settings: Settings):
+    engine = create_engine(normalize_database_url(settings.database_url), echo=False)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    return engine, session_factory
+`,
+          'app/infra/database/models/__init__.py': '',
+          'app/infra/database/models/user_model.py': `from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy import DateTime, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.infra.database.base import Base
+
+
+class UserModel(Base):
+    __tablename__ = 'users'
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+`,
+          'app/infra/database/migrations/README.md': `Use Alembic para versionar o schema deste backend.
+
+Sugestão:
+- alembic init app/infra/database/migrations
+- alembic revision --autogenerate -m "init"
+- alembic upgrade head
+`,
+        }
+      : {
+          'app/infra/database/README.md': 'Persistência em memória habilitada neste scaffold.\n',
+        }),
+    'app/infra/observability/__init__.py': '',
+    'app/infra/observability/readiness.py': `from dataclasses import dataclass
+
+${withPostgres ? 'from sqlalchemy import text\n' : ''}
+
+
+@dataclass(slots=True)
+class ReadinessStatus:
+    ok: bool
+    detail: str
+
+
+class MemoryReadinessProbe:
+    def check(self) -> ReadinessStatus:
+        return ReadinessStatus(ok=True, detail='memory-ready')
+
+
+${withPostgres ? `class SqlAlchemyReadinessProbe:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def check(self) -> ReadinessStatus:
+        try:
+            with self.session_factory() as session:
+                session.execute(text('SELECT 1'))
+            return ReadinessStatus(ok=True, detail='postgres-ready')
+        except Exception:
+            return ReadinessStatus(ok=False, detail='postgres-unavailable')
+` : ''}
+`,
+    'app/infra/repositories/__init__.py': '',
+    'app/infra/repositories/memory/__init__.py': '',
+    'app/infra/repositories/memory/user_repository.py': `from datetime import datetime, timezone
+from uuid import uuid4
+
+from app.domain.users.contracts.user_repository import UserRepositoryContract
+from app.domain.users.entities.user import UserEntity
+
+
+class InMemoryUserRepository(UserRepositoryContract):
+    _users: dict[str, UserEntity] = {}
+
+    def create(self, *, name: str, email: str, password_hash: str) -> UserEntity:
+        user = UserEntity(
+            id=str(uuid4()),
+            name=name,
+            email=email,
+            password_hash=password_hash,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._users[user.id] = user
+        return user
+
+    def find_by_email(self, email: str) -> UserEntity | None:
+        return next((user for user in self._users.values() if user.email == email), None)
+
+    def find_by_id(self, user_id: str) -> UserEntity | None:
+        return self._users.get(user_id)
+`,
+    ...(withPostgres
+      ? {
+          'app/infra/repositories/sqlalchemy/__init__.py': '',
+          'app/infra/repositories/sqlalchemy/user_repository.py': `from sqlalchemy.orm import Session
+
+from app.domain.users.contracts.user_repository import UserRepositoryContract
+from app.domain.users.entities.user import UserEntity
+from app.infra.database.models.user_model import UserModel
+
+
+class SqlAlchemyUserRepository(UserRepositoryContract):
+    def __init__(self, session: Session):
+        self.session = session
+
+    def create(self, *, name: str, email: str, password_hash: str) -> UserEntity:
+        model = UserModel(
+            name=name,
+            email=email,
+            password_hash=password_hash,
+        )
+        self.session.add(model)
+        self.session.commit()
+        self.session.refresh(model)
+        return UserEntity(
+            id=model.id,
+            name=model.name,
+            email=model.email,
+            password_hash=model.password_hash,
+            created_at=model.created_at.isoformat(),
+        )
+
+    def find_by_email(self, email: str) -> UserEntity | None:
+        model = self.session.query(UserModel).filter(UserModel.email == email).one_or_none()
+        if not model:
+            return None
+        return UserEntity(
+            id=model.id,
+            name=model.name,
+            email=model.email,
+            password_hash=model.password_hash,
+            created_at=model.created_at.isoformat(),
+        )
+
+    def find_by_id(self, user_id: str) -> UserEntity | None:
+        model = self.session.query(UserModel).filter(UserModel.id == user_id).one_or_none()
+        if not model:
+            return None
+        return UserEntity(
+            id=model.id,
+            name=model.name,
+            email=model.email,
+            password_hash=model.password_hash,
+            created_at=model.created_at.isoformat(),
+        )
+`,
+        }
+      : {}),
+    'app/infra/security/password_hasher.py': `from passlib.context import CryptContext
 
 from app.application.security.password_hasher_contract import PasswordHasherContract
 
@@ -1853,20 +2400,35 @@ class BcryptPasswordHasher(PasswordHasherContract):
     def compare(self, value: str, hashed_value: str) -> bool:
         return pwd_context.verify(value, hashed_value)
 `,
-    'app/infra/security/jwt_token_service.py': `from jose import JWTError, jwt
+    'app/infra/security/jwt_token_service.py': `from datetime import datetime, timedelta, timezone
+
+from jose import JWTError, jwt
 
 from app.application.security.token_service_contract import TokenServiceContract
-from app.shared.config.settings import settings
+from app.infra.config.settings import Settings
 from app.shared.errors.app_error import AppError
 
 
 class JwtTokenService(TokenServiceContract):
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
     def sign_access_token(self, payload: dict[str, str]) -> str:
-        return jwt.encode(payload, settings.jwt_access_secret, algorithm='HS256')
+        issued_at = datetime.now(timezone.utc)
+        expires_at = issued_at + timedelta(minutes=self.settings.jwt_access_expires_minutes)
+        return jwt.encode(
+            {
+                **payload,
+                'iat': int(issued_at.timestamp()),
+                'exp': int(expires_at.timestamp()),
+            },
+            self.settings.jwt_access_secret,
+            algorithm='HS256',
+        )
 
     def verify_access_token(self, token: str) -> dict[str, str]:
         try:
-            payload = jwt.decode(token, settings.jwt_access_secret, algorithms=['HS256'])
+            payload = jwt.decode(token, self.settings.jwt_access_secret, algorithms=['HS256'])
         except JWTError as error:
             raise AppError('Token inválido ou expirado.', status_code=401, code='INVALID_TOKEN') from error
 
@@ -1878,168 +2440,165 @@ class JwtTokenService(TokenServiceContract):
             'email': str(payload['email']),
         }
 `,
-    'app/infra/repositories/in_memory_user_repository.py': `from datetime import datetime, timezone
-from uuid import uuid4
+    'app/presentation/__init__.py': '',
+    'app/presentation/http/__init__.py': '',
+    'app/presentation/http/api.py': `from fastapi import APIRouter
 
-from app.domain.users.contracts.user_repository_contract import UserRepositoryContract
-from app.domain.users.entities.user_entity import UserEntity
-from app.shared.config.settings import settings
+from app.presentation.http.routes.auth import router as auth_router
+from app.presentation.http.routes.health import router as health_router
+from app.presentation.http.routes.users import router as users_router
 
-
-class InMemoryUserRepository(UserRepositoryContract):
-    _users: dict[str, UserEntity] = {}
-
-    def create(self, payload: dict[str, str]) -> UserEntity:
-        user = UserEntity(
-            id=str(uuid4()),
-            name=payload['name'],
-            email=payload['email'],
-            password_hash=payload['password_hash'],
-            created_at=datetime.now(timezone.utc).isoformat(),
-            data_layer=settings.data_layer,
-        )
-        self._users[user.id] = user
-        return user
-
-    def find_by_email(self, email: str) -> UserEntity | None:
-        return next((user for user in self._users.values() if user.email == email), None)
-
-    def find_by_id(self, user_id: str) -> UserEntity | None:
-        return self._users.get(user_id)
+router = APIRouter()
+router.include_router(health_router)
+router.include_router(auth_router)
+router.include_router(users_router)
 `,
-    ...(withPostgres
-      ? {
-          'app/infra/database.py': `from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+    'app/presentation/http/dependencies/__init__.py': '',
+    'app/presentation/http/dependencies/container.py': `from fastapi import Request
 
-from app.shared.config.settings import settings
+from app.bootstrap.container import AppContainer
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-engine = create_engine(settings.database_url, echo=False)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+def get_container(request: Request) -> AppContainer:
+    return request.app.state.container
 `,
-          'app/infra/models/__init__.py': '',
-          'app/infra/models/user_model.py': `from datetime import datetime
-from uuid import uuid4
+    'app/presentation/http/dependencies/db.py': `from collections.abc import Generator
+from typing import Any
 
-from sqlalchemy import DateTime, String
-from sqlalchemy.orm import Mapped, mapped_column
+from fastapi import Depends
 
-from app.infra.database import Base
+from app.bootstrap.container import AppContainer
+from app.presentation.http.dependencies.container import get_container
 
 
-class UserModel(Base):
-    __tablename__ = 'users'
+def get_db_session(
+    container: AppContainer = Depends(get_container),
+) -> Generator[Any | None, None, None]:
+    if container.session_factory is None:
+        yield None
+        return
 
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(String, nullable=False)
-    data_layer: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    with container.session_factory() as session:
+        yield session
 `,
-          'app/infra/repositories/sqlalchemy_user_repository.py': `from app.domain.users.contracts.user_repository_contract import UserRepositoryContract
-from app.domain.users.entities.user_entity import UserEntity
-from app.infra.database import SessionLocal
-from app.infra.models.user_model import UserModel
-from app.shared.config.settings import settings
+    'app/presentation/http/dependencies/use_cases.py': `from typing import Any
+
+from fastapi import Depends
+
+from app.application.auth.use_cases.login import LoginUseCase
+from app.application.users.use_cases.get_current_user import GetCurrentUserUseCase
+from app.application.users.use_cases.register_user import RegisterUserUseCase
+from app.bootstrap.container import AppContainer
+from app.presentation.http.dependencies.container import get_container
+from app.presentation.http.dependencies.db import get_db_session
 
 
-class SqlAlchemyUserRepository(UserRepositoryContract):
-    def create(self, payload: dict[str, str]) -> UserEntity:
-        with SessionLocal() as session:
-            model = UserModel(
-                name=payload['name'],
-                email=payload['email'],
-                password_hash=payload['password_hash'],
-                data_layer=settings.data_layer,
-            )
-            session.add(model)
-            session.commit()
-            session.refresh(model)
+def get_register_user_use_case(
+    container: AppContainer = Depends(get_container),
+    db_session: Any | None = Depends(get_db_session),
+) -> RegisterUserUseCase:
+    return container.build_register_user_use_case(db_session)
 
-            return UserEntity(
-                id=model.id,
-                name=model.name,
-                email=model.email,
-                password_hash=model.password_hash,
-                created_at=model.created_at.isoformat(),
-                data_layer=model.data_layer,
-            )
 
-    def find_by_email(self, email: str) -> UserEntity | None:
-        with SessionLocal() as session:
-            model = session.query(UserModel).filter(UserModel.email == email).one_or_none()
-            if not model:
-                return None
-            return UserEntity(
-                id=model.id,
-                name=model.name,
-                email=model.email,
-                password_hash=model.password_hash,
-                created_at=model.created_at.isoformat(),
-                data_layer=model.data_layer,
-            )
+def get_login_use_case(
+    container: AppContainer = Depends(get_container),
+    db_session: Any | None = Depends(get_db_session),
+) -> LoginUseCase:
+    return container.build_login_use_case(db_session)
 
-    def find_by_id(self, user_id: str) -> UserEntity | None:
-        with SessionLocal() as session:
-            model = session.query(UserModel).filter(UserModel.id == user_id).one_or_none()
-            if not model:
-                return None
-            return UserEntity(
-                id=model.id,
-                name=model.name,
-                email=model.email,
-                password_hash=model.password_hash,
-                created_at=model.created_at.isoformat(),
-                data_layer=model.data_layer,
-            )
+
+def get_current_user_use_case(
+    container: AppContainer = Depends(get_container),
+    db_session: Any | None = Depends(get_db_session),
+) -> GetCurrentUserUseCase:
+    return container.build_get_current_user_use_case(db_session)
 `,
-        }
-      : {}),
-    'app/infra/dependencies.py': `from fastapi import Depends
+    'app/presentation/http/dependencies/auth.py': `from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.application.auth.use_cases.login_use_case import LoginUseCase
-from app.application.users.use_cases.get_current_user_use_case import GetCurrentUserUseCase
-from app.application.users.use_cases.register_user_use_case import RegisterUserUseCase
-from app.infra.security.bcrypt_password_hasher import BcryptPasswordHasher
-import app.infra.security.jwt_token_service as jwt_token_service_module
-${withPostgres ? "from app.infra.repositories.sqlalchemy_user_repository import SqlAlchemyUserRepository" : "from app.infra.repositories.in_memory_user_repository import InMemoryUserRepository"}
+from app.bootstrap.container import AppContainer
+from app.presentation.http.dependencies.container import get_container
 from app.shared.errors.app_error import AppError
 
 security = HTTPBearer(auto_error=False)
-user_repository = ${withPostgres ? 'SqlAlchemyUserRepository()' : 'InMemoryUserRepository()'}
-password_hasher = BcryptPasswordHasher()
-token_service = jwt_token_service_module.JwtTokenService()
-
-
-def get_register_user_use_case() -> RegisterUserUseCase:
-    return RegisterUserUseCase(user_repository, password_hasher)
-
-
-def get_login_use_case() -> LoginUseCase:
-    return LoginUseCase(user_repository, password_hasher, token_service)
-
-
-def get_current_user_use_case() -> GetCurrentUserUseCase:
-    return GetCurrentUserUseCase(user_repository)
 
 
 def get_current_user_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    container: AppContainer = Depends(get_container),
 ) -> str:
     if not credentials:
         raise AppError('Token ausente.', status_code=401, code='MISSING_TOKEN')
 
-    payload = token_service.verify_access_token(credentials.credentials)
+    payload = container.token_service.verify_access_token(credentials.credentials)
     return payload['sub']
 `,
-    'app/presentation/http/models.py': `from pydantic import BaseModel, EmailStr, Field
+    'app/presentation/http/routes/__init__.py': '',
+    'app/presentation/http/errors/__init__.py': '',
+    'app/presentation/http/errors/problem_details.py': `def build_problem_details(
+    *,
+    status: int,
+    title: str,
+    code: str,
+    detail: str,
+    type_: str = 'about:blank',
+):
+    return {
+        'type': type_,
+        'title': title,
+        'status': status,
+        'code': code,
+        'detail': detail,
+    }
+`,
+    'app/presentation/http/errors/handlers.py': `from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.presentation.http.errors.problem_details import build_problem_details
+from app.shared.errors.app_error import AppError
+
+
+def register_exception_handlers(app: FastAPI):
+    @app.exception_handler(AppError)
+    async def handle_application_error(_request: Request, error: AppError):
+        return JSONResponse(
+            status_code=error.status_code,
+            content=build_problem_details(
+                status=error.status_code,
+                title='Application Error',
+                code=error.code,
+                detail=error.message,
+            ),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(_request: Request, error: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content=build_problem_details(
+                status=422,
+                title='Validation Error',
+                code='VALIDATION_ERROR',
+                detail='Payload inválido.',
+            )
+            | {'errors': error.errors()},
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(_request: Request, _error: Exception):
+        return JSONResponse(
+            status_code=500,
+            content=build_problem_details(
+                status=500,
+                title='Internal Server Error',
+                code='INTERNAL_SERVER_ERROR',
+                detail='Erro interno não tratado.',
+            ),
+        )
+`,
+    'app/presentation/http/schemas/__init__.py': '',
+    'app/presentation/http/schemas/auth.py': `from pydantic import BaseModel, EmailStr, Field
 
 
 class RegisterUserBody(BaseModel):
@@ -2058,79 +2617,75 @@ class UserResponse(BaseModel):
     name: str
     email: EmailStr
     created_at: str
-    data_layer: str
 
 
 class AuthResponse(BaseModel):
     access_token: str
     user: UserResponse
+`,
+    'app/presentation/http/schemas/health.py': `from pydantic import BaseModel
 
 
 class HealthResponse(BaseModel):
     status: str
     framework: str
     auth_strategy: str
-    data_layer: str
+    persistence: str
     orm: str
-    timestamp: str
+    detail: str
 `,
-    'app/presentation/http/errors.py': `from fastapi import FastAPI, Request
+    'app/presentation/http/routes/health.py': `from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
-from app.shared.errors.app_error import AppError
-
-
-def register_exception_handlers(app: FastAPI):
-    @app.exception_handler(AppError)
-    async def handle_application_error(_request: Request, error: AppError):
-        return JSONResponse(
-            status_code=error.status_code,
-            content={
-                'message': error.message,
-                'code': error.code,
-                'details': error.details,
-            },
-        )
-
-    @app.exception_handler(Exception)
-    async def handle_unexpected_error(_request: Request, error: Exception):
-        return JSONResponse(
-            status_code=500,
-            content={
-                'message': 'Erro interno não tratado.',
-                'code': 'INTERNAL_SERVER_ERROR',
-                'details': str(error),
-            },
-        )
-`,
-    'app/presentation/http/routes/health.py': `from datetime import datetime, timezone
-
-from fastapi import APIRouter
-
-from app.presentation.http.models import HealthResponse
-from app.shared.config.runtime import RUNTIME_CONFIG
-from app.shared.config.settings import settings
+from app.bootstrap.container import AppContainer
+from app.bootstrap.runtime import RUNTIME_CONFIG
+from app.presentation.http.dependencies.container import get_container
+from app.presentation.http.schemas.health import HealthResponse
 
 router = APIRouter(prefix='/health', tags=['health'])
 
 
-@router.get('', response_model=HealthResponse)
-def health_check() -> HealthResponse:
+@router.get('/live', response_model=HealthResponse)
+def live() -> HealthResponse:
     return HealthResponse(
         status='ok',
         framework=RUNTIME_CONFIG['framework'],
         auth_strategy=RUNTIME_CONFIG['auth_strategy'],
-        data_layer=settings.data_layer,
-        orm='${withPostgres ? 'sqlalchemy' : 'memory'}',
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        persistence=RUNTIME_CONFIG['persistence'],
+        orm=RUNTIME_CONFIG['orm'],
+        detail='process-alive',
     )
+
+
+@router.get('/ready', response_model=HealthResponse)
+def ready(
+    container: AppContainer = Depends(get_container),
+):
+    readiness = container.readiness_probe.check()
+    response = HealthResponse(
+        status='ok' if readiness.ok else 'degraded',
+        framework=RUNTIME_CONFIG['framework'],
+        auth_strategy=RUNTIME_CONFIG['auth_strategy'],
+        persistence=RUNTIME_CONFIG['persistence'],
+        orm=RUNTIME_CONFIG['orm'],
+        detail=readiness.detail,
+    )
+    if readiness.ok:
+        return response
+
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=response.model_dump())
 `,
     'app/presentation/http/routes/auth.py': `from fastapi import APIRouter, Depends, status
 
-from app.application.auth.use_cases.login_use_case import LoginUseCase
-from app.application.users.use_cases.register_user_use_case import RegisterUserUseCase
-from app.infra.dependencies import get_login_use_case, get_register_user_use_case
-from app.presentation.http.models import AuthResponse, LoginBody, RegisterUserBody, UserResponse
+from app.application.auth.dto.login_command import LoginCommand
+from app.application.auth.use_cases.login import LoginUseCase
+from app.application.users.dto.register_user_command import RegisterUserCommand
+from app.application.users.use_cases.register_user import RegisterUserUseCase
+from app.presentation.http.dependencies.use_cases import (
+    get_login_use_case,
+    get_register_user_use_case,
+)
+from app.presentation.http.schemas.auth import AuthResponse, LoginBody, RegisterUserBody, UserResponse
 
 router = APIRouter(prefix='/auth', tags=['auth'])
 
@@ -2140,7 +2695,19 @@ def register(
     body: RegisterUserBody,
     use_case: RegisterUserUseCase = Depends(get_register_user_use_case),
 ) -> UserResponse:
-    return use_case.execute(body)
+    result = use_case.execute(
+        RegisterUserCommand(
+            name=body.name,
+            email=str(body.email),
+            password=body.password,
+        ),
+    )
+    return UserResponse(
+        id=result.id,
+        name=result.name,
+        email=result.email,
+        created_at=result.created_at,
+    )
 
 
 @router.post('/login', response_model=AuthResponse)
@@ -2148,13 +2715,28 @@ def login(
     body: LoginBody,
     use_case: LoginUseCase = Depends(get_login_use_case),
 ) -> AuthResponse:
-    return use_case.execute(body)
+    result = use_case.execute(
+        LoginCommand(
+            email=str(body.email),
+            password=body.password,
+        ),
+    )
+    return AuthResponse(
+        access_token=result.access_token,
+        user=UserResponse(
+            id=result.user.id,
+            name=result.user.name,
+            email=result.user.email,
+            created_at=result.user.created_at,
+        ),
+    )
 `,
     'app/presentation/http/routes/users.py': `from fastapi import APIRouter, Depends
 
-from app.application.users.use_cases.get_current_user_use_case import GetCurrentUserUseCase
-from app.infra.dependencies import get_current_user_id, get_current_user_use_case
-from app.presentation.http.models import UserResponse
+from app.application.users.use_cases.get_current_user import GetCurrentUserUseCase
+from app.presentation.http.dependencies.auth import get_current_user_id
+from app.presentation.http.dependencies.use_cases import get_current_user_use_case
+from app.presentation.http.schemas.auth import UserResponse
 
 router = APIRouter(prefix='/users', tags=['users'])
 
@@ -2164,7 +2746,65 @@ def get_me(
     user_id: str = Depends(get_current_user_id),
     use_case: GetCurrentUserUseCase = Depends(get_current_user_use_case),
 ) -> UserResponse:
-    return use_case.execute(user_id)
+    result = use_case.execute(user_id)
+    return UserResponse(
+        id=result.id,
+        name=result.name,
+        email=result.email,
+        created_at=result.created_at,
+    )
+`,
+    'app/shared/__init__.py': '',
+    'app/shared/errors/__init__.py': '',
+    'app/shared/errors/app_error.py': `class AppError(Exception):
+    def __init__(self, message: str, status_code: int = 400, code: str = 'APPLICATION_ERROR', details=None):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.code = code
+        self.details = details
+`,
+    'tests/__init__.py': '',
+    'tests/unit/__init__.py': '',
+    'tests/e2e/__init__.py': '',
+    'tests/unit/test_register_user_use_case.py': `from app.application.users.dto.register_user_command import RegisterUserCommand
+from app.application.users.use_cases.register_user import RegisterUserUseCase
+from app.infra.repositories.memory.user_repository import InMemoryUserRepository
+
+
+class FakePasswordHasher:
+    def hash(self, value: str) -> str:
+        return 'hashed::' + value
+
+    def compare(self, value: str, hashed_value: str) -> bool:
+        return hashed_value == 'hashed::' + value
+
+
+def test_register_user_creates_a_new_user():
+    use_case = RegisterUserUseCase(InMemoryUserRepository(), FakePasswordHasher())
+
+    result = use_case.execute(
+        RegisterUserCommand(
+            name='Antonio',
+            email='antonio@example.com',
+            password='12345678',
+        ),
+    )
+
+    assert result.email == 'antonio@example.com'
+    assert result.name == 'Antonio'
+`,
+    'tests/e2e/test_health_live.py': `${withPostgres ? "import os\n\nos.environ.setdefault('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/app_db')\n\n" : ''}from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_live_health_endpoint():
+    client = TestClient(app)
+    response = client.get('/api/health/live')
+
+    assert response.status_code == 200
+    assert response.json()['status'] == 'ok'
 `,
     'README.md': getBackendReadme(
       'Backend FastAPI',
@@ -2173,9 +2813,16 @@ def get_me(
       [
         '```bash',
         'cp .env.example .env',
+        ...(withPostgres && answers.useDocker && answers.provisionPostgres
+          ? [
+              'cp ../../infra/docker/.env.example ../../infra/docker/.env',
+              'docker compose -f ../../infra/docker/docker-compose.yml --env-file ../../infra/docker/.env up -d',
+            ]
+          : []),
         'python3 -m venv .venv',
         'source .venv/bin/activate',
-        'pip install -r requirements.txt',
+        'pip install -r requirements-dev.txt',
+        'make test',
         'uvicorn app.main:app --reload --port 3001',
         '```',
       ],

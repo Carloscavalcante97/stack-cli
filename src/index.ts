@@ -19,7 +19,7 @@ import { tryRun } from './utils/exec.js'
 import { ensureDir, fileExists } from './utils/fs.js'
 import { usesPostgres } from './types.js'
 
-const baseDir = path.join(os.homedir(), 'projetos')
+const baseDir = path.join(os.homedir(), 'projects')
 
 function printBanner() {
   console.log('\n')
@@ -45,24 +45,40 @@ function printSummary(
   console.log(`  • Persistência: ${answers.dataLayer}`)
   console.log(`  • Husky: ${answers.useHusky ? 'sim' : 'não'}`)
   console.log(`  • Docker: ${answers.useDocker ? 'sim' : 'não'}`)
-  console.log(`  • PostgreSQL local: ${answers.provisionPostgres ? 'sim' : 'não'}`)
+  console.log(
+    `  • PostgreSQL local: ${answers.provisionPostgres ? 'sim' : 'não'}`,
+  )
   console.log(`  • Redis: ${answers.useRedis ? 'sim' : 'não'}`)
   console.log('')
 
   console.log(chalk.cyan('Arquitetura base'))
-  console.log('  • apps/backend com camadas domain/application/infra/presentation')
-  console.log('  • apps/frontend com env centralizado e interface inicial pronta para produto')
+  console.log(
+    '  • apps/backend com camadas domain/application/infra/presentation',
+  )
+  console.log(
+    '  • apps/frontend com env centralizado e interface inicial pronta para produto',
+  )
   console.log('  • infra/docker para serviços locais')
   console.log('  • workspace pnpm pronto para evolução por app')
   console.log('')
 
+  console.log(chalk.yellow('Importante'))
+  console.log(
+    '  Antes de rodar qualquer app, copie os arquivos de ambiente .env/.env.local a partir dos exemplos gerados.',
+  )
+  console.log('')
+
   console.log(chalk.yellow('Próximos passos'))
   console.log(`  cd ${projectDir}`)
-  console.log('  cp apps/backend/.env.example apps/backend/.env  # se existir backend')
+  console.log(
+    '  cp apps/backend/.env.example apps/backend/.env  # se existir backend',
+  )
 
   if (answers.frontend !== 'none') {
     if (answers.frontend === 'next') {
-      console.log('  cp apps/frontend/.env.local.example apps/frontend/.env.local')
+      console.log(
+        '  cp apps/frontend/.env.local.example apps/frontend/.env.local',
+      )
     } else {
       console.log('  cp apps/frontend/.env.example apps/frontend/.env')
     }
@@ -87,6 +103,10 @@ function printSummary(
 
   if (answers.backend === 'nest' || answers.backend === 'express') {
     console.log(chalk.magenta('Backend Node'))
+    if (usesPostgres(answers)) {
+      console.log('  pnpm --filter @apps/backend db:generate')
+      console.log('  pnpm --filter @apps/backend db:migrate')
+    }
     console.log('  pnpm --filter @apps/backend dev')
     console.log('')
   }
@@ -99,7 +119,9 @@ function printSummary(
 
   if (answers.useDocker) {
     console.log(chalk.magenta('Infra'))
-    console.log('  docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d')
+    console.log(
+      '  docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d',
+    )
     console.log('')
   }
 
@@ -110,7 +132,9 @@ function printSummary(
   }
 
   console.log(
-    chalk.gray('O scaffold já nasce com validação, separação de camadas e base para produção.'),
+    chalk.gray(
+      'O scaffold já nasce com validação, separação de camadas e base para produção.',
+    ),
   )
   console.log('')
 }

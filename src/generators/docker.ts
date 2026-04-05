@@ -3,11 +3,23 @@ import { ensureDir, writeFile } from '../utils/fs.js'
 import type { Answers } from '../types.js'
 import { usesPostgres } from '../types.js'
 
+function toDockerContainerName(value: string) {
+  const sanitized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, '-')
+    .replace(/^[^a-z0-9]+/, '')
+    .replace(/-+/g, '-')
+
+  return sanitized || 'app'
+}
+
 export function createDockerCompose(projectDir: string, answers: Answers) {
   if (!answers.useDocker) return
 
   const dockerDir = path.join(projectDir, 'infra', 'docker')
   ensureDir(dockerDir)
+  const containerBaseName = toDockerContainerName(answers.projectName)
 
   let content = 'services:\n'
 
@@ -15,7 +27,7 @@ export function createDockerCompose(projectDir: string, answers: Answers) {
     content += `
   postgres:
     image: postgres:16
-    container_name: ${answers.projectName}_postgres
+    container_name: ${containerBaseName}_postgres
     environment:
       POSTGRES_USER: \${POSTGRES_USER}
       POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
@@ -36,7 +48,7 @@ export function createDockerCompose(projectDir: string, answers: Answers) {
     content += `
   redis:
     image: redis:7
-    container_name: ${answers.projectName}_redis
+    container_name: ${containerBaseName}_redis
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
