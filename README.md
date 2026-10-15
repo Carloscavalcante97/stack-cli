@@ -74,12 +74,31 @@ O frontend sai com:
 - ponto claro para integração com API
 - base visual inicial para continuar o produto
 
+### Autenticação
+
+- `JWT próprio`: cadastro, login e senha no backend (bcrypt + JWT assinado com segredo gerado na hora)
+- `Firebase Auth`: login no frontend com o SDK do Firebase (e-mail/senha e Google); o backend só verifica o ID token com o Admin SDK
+
+Com Firebase:
+
+- os backends não têm `register`/`login`; `GET /api/users/me` cria o usuário local (id = UID do Firebase) no primeiro acesso
+- no Nest, um guard global protege tudo por padrão e `@Public()` libera rotas (o health já vem liberado); `@CurrentUser()` entrega o usuário do token
+- Next e Vite saem com `AuthProvider`/`useAuth()`, ações `login`/`register`/`loginWithGoogle`/`logout` e um `apiFetch` que envia o ID token para a API
+- Node verifica token só com `FIREBASE_PROJECT_ID`; o SDK Python exige credencial (`GOOGLE_APPLICATION_CREDENTIALS`) fora do GCP
+- dá para desenvolver sem projeto real com o emulador: `firebase emulators:start --only auth --project demo-app` na raiz do projeto gerado
+
 ### Infra local
 
-Opcionalmente, o projeto pode sair com:
+Com PostgreSQL, o projeto pode sair com o banco local via Docker Compose.
 
-- `PostgreSQL` via Docker Compose
-- `Redis` via Docker Compose
+### Qualidade e deploy
+
+Todo projeto com app sai com:
+
+- `Dockerfile` por app, com build a partir da raiz do monorepo: Node com `pnpm deploy` (só dependências de produção), Next em modo `standalone`, Vite servido por nginx e FastAPI com uvicorn
+- com Prisma, o container roda `prisma migrate deploy` antes de subir
+- GitHub Actions (`.github/workflows/ci.yml`) com lint, testes, build e build das imagens
+- ESLint (flat config na raiz, com `typescript-eslint` e regras de hooks do React no frontend) nos apps TypeScript; o FastAPI usa `ruff`
 
 ## O que diferencia este CLI de um scaffold raso
 
@@ -108,6 +127,7 @@ hash -r
 ### 3. Executar o CLI
 
 ```bash
+cd ~/projects   # o projeto é criado no diretório atual
 create-stack
 ```
 
@@ -116,11 +136,12 @@ O CLI pergunta por:
 - nome do projeto
 - backend
 - frontend
+- autenticação (JWT próprio ou Firebase Auth)
 - persistência inicial
 - uso de Husky
-- Docker Compose
-- PostgreSQL local
-- Redis local
+- PostgreSQL local via Docker Compose (só quando a persistência é PostgreSQL)
+
+O nome do projeto aceita letras minúsculas, números, `.`, `_` e `-`, porque vira nome de pasta, de pacote e de container.
 
 ## Exemplo de uso
 
@@ -181,56 +202,51 @@ Os templates de backend saem com um conjunto mínimo de rotas úteis:
 - `GET /api/health` para `Express` e `Nest`
 - `GET /api/health/live` para `FastAPI`
 - `GET /api/health/ready` para `FastAPI`
-- `POST /api/auth/register`
-- `POST /api/auth/login`
+- `POST /api/auth/register` (só com JWT próprio)
+- `POST /api/auth/login` (só com JWT próprio)
 - `GET /api/users/me`
 
 ## Fluxo após gerar um projeto
 
-O CLI já imprime os próximos passos no terminal, mas o caminho padrão é:
+O CLI já roda `git init` e `pnpm install`, e gera `apps/backend/.env` com um `JWT_ACCESS_SECRET` aleatório (fora do git). Com Firebase, preencha `FIREBASE_PROJECT_ID` no backend e a config web do Firebase no frontend. O `.env.example` versionado não traz segredo nenhum. Os próximos passos também aparecem no terminal:
 
 ```bash
-cd ~/projects/<nome-do-projeto>
-pnpm install
-```
-
-Depois:
-
-### Backend Node
-
-```bash
-cp apps/backend/.env.example apps/backend/.env
-pnpm --filter @apps/backend dev
-```
-
-Se o projeto usar PostgreSQL:
-
-```bash
-pnpm --filter @apps/backend db:generate
-pnpm --filter @apps/backend db:migrate
-pnpm --filter @apps/backend dev
-```
-
-### Backend FastAPI
-
-```bash
-cd apps/backend
-cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-make test
-uvicorn app.main:app --reload --port 3001
+cd <nome-do-projeto>
 ```
 
 ### Infra local
 
-Se o projeto foi gerado com Docker:
+Se o projeto foi gerado com PostgreSQL local:
 
 ```bash
-cp infra/docker/.env.example infra/docker/.env
-docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d
+docker compose -f infra/docker/docker-compose.yml up -d
 ```
+
+### Backend Node
+
+```bash
+pnpm dev:backend
+```
+
+Se o projeto usar PostgreSQL, rode a migration antes:
+
+```bash
+pnpm --filter @apps/backend db:migrate
+pnpm dev:backend
+```
+
+### Backend FastAPI (Python >= 3.12)
+
+```bash
+cd apps/backend
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+make test
+make dev
+```
+
+Com PostgreSQL, as tabelas são criadas no startup. O README gerado explica como migrar para Alembic quando o schema evoluir.
 
 ## Para quem este projeto é
 
@@ -260,12 +276,29 @@ Hoje o projeto já é adequado para:
 - demonstração pública
 - uso como base para novos projetos
 
+Cada stack é validada pelo smoke test (ver abaixo).
+
 Evoluções naturais que ainda fazem sentido:
 
-- CI inicial por stack
+- rodar o smoke test em CI
+- Redis (saiu do scaffold até existir um uso real, como cache ou fila)
 - mais testes gerados
 - variantes assíncronas no FastAPI
 - módulos mais ricos por contexto de domínio
+
+## Desenvolvendo o CLI
+
+Os templates ficam em strings dentro de `src/generators`, então o editor não checa o código gerado. Antes de publicar uma mudança, rode:
+
+```bash
+pnpm smoke
+```
+
+O smoke gera Nest, Express e FastAPI (com e sem PostgreSQL, com JWT e com Firebase), mais Next e Vite, num diretório temporário. Em cada um roda build, testes e lint, e builda a imagem de cada app, sobe o container e espera o health responder. Nos backends sem banco, sobe o servidor e testa a autenticação de verdade: `register → login → /users/me` no JWT, e um usuário criado no emulador do Firebase Auth chamando `/users/me` no Firebase.
+
+As variantes com PostgreSQL sobem o banco pelo `docker-compose` gerado e rodam a migration antes do teste.
+
+Requer `pnpm`, [`uv`](https://docs.astral.sh/uv/), Docker e `firebase-tools` com Java (para o emulador). Para rodar só alguns casos: `pnpm smoke nest-fb fastapi`.
 
 ## Stack do próprio CLI
 

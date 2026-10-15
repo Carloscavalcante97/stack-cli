@@ -9,7 +9,8 @@
   },
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {
     "@inquirer/prompts": "^7.3.2",

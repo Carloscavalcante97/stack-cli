@@ -1,32 +1,68 @@
+import { randomBytes } from 'node:crypto'
 import path from 'node:path'
 import { writeFile } from '../utils/fs.js'
 import type { Answers } from '../types.js'
 import { usesPostgres } from '../types.js'
+import {
+  expressFirebaseOverlay,
+  fastApiFirebaseOverlay,
+  nestFirebaseOverlay,
+  type FileOverlay,
+} from './firebase.js'
 
-function createFiles(baseDir: string, files: Record<string, string>) {
-  for (const [relativePath, content] of Object.entries(files)) {
-    writeFile(path.join(baseDir, relativePath), content)
+function createFiles(
+  baseDir: string,
+  files: Record<string, string>,
+  overlay: FileOverlay = {},
+) {
+  for (const [relativePath, content] of Object.entries({ ...files, ...overlay })) {
+    if (content !== null) writeFile(path.join(baseDir, relativePath), content)
   }
 }
 
-function getBackendEnvExample(answers: Answers) {
-  const lines = [
+// Variáveis opcionais ficam comentadas: valor vazio quebra o SDK do Firebase
+function getFirebaseEnvLines(answers: Answers) {
+  return [
+    '# ID do projeto: Console do Firebase > Configurações do projeto',
+    'FIREBASE_PROJECT_ID=',
+    ...(answers.backend === 'fastapi'
+      ? [
+          '# Python exige service account para verificar token (fora do GCP e do emulador)',
+          '# GOOGLE_APPLICATION_CREDENTIALS=/caminho/para/service-account.json',
+        ]
+      : []),
+    '# Dev local sem projeto real: firebase emulators:start --only auth --project demo-app',
+    '# FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099',
+  ]
+}
+
+// .env.example vai pro git sem segredo; .env (ignorado) já nasce com um aleatório
+function withEnvFiles(lines: (secret: string) => string[]) {
+  const render = (secret: string) => `${lines(secret).join('\n')}\n`
+  return {
+    '.env.example': render(''),
+    '.env': render(randomBytes(32).toString('base64url')),
+  }
+}
+
+function getBackendEnvFiles(answers: Answers) {
+  return withEnvFiles((secret) => [
     'PORT=3001',
     'GLOBAL_PREFIX=api',
     'NODE_ENV=development',
     'APP_NAME=Create Stack API',
     'CORS_ORIGIN=http://localhost:3000,http://localhost:5173',
-    'JWT_ACCESS_SECRET=change-this-secret-with-at-least-32-characters',
-    'JWT_ACCESS_EXPIRES_IN=1d',
-  ]
-
-  if (usesPostgres(answers)) {
-    lines.push(
-      'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app_db',
-    )
-  }
-
-  return `${lines.join('\n')}\n`
+    ...(answers.auth === 'firebase'
+      ? getFirebaseEnvLines(answers)
+      : [
+          '# Gere com: openssl rand -base64 32',
+          `JWT_ACCESS_SECRET=${secret}`,
+          'JWT_ACCESS_EXPIRES_IN=1d',
+        ]),
+    ...(usesPostgres(answers)
+      ? ['DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app_db']
+      : []),
+  ])
 }
 
 function getBackendReadme(
@@ -36,50 +72,70 @@ function getBackendReadme(
   runInstructions: string[],
 ) {
   const backendDataLayer = usesPostgres(answers) ? 'postgres' : 'memory'
+  const withFirebase = answers.auth === 'firebase'
+  const healthEndpoints =
+    answers.backend === 'fastapi'
+      ? ['- `GET /api/health/live`', '- `GET /api/health/ready`']
+      : ['- `GET /api/health`']
   const sections = [
     `# ${title}`,
     '',
     '## Importante',
-    '- Copie `.env.example` para `.env` antes de rodar o backend.',
+    ...(withFirebase
+      ? ['- Preencha `FIREBASE_PROJECT_ID` no `.env` (Console do Firebase > Configurações do projeto).']
+      : [
+          '- O `.env` já vem gerado com um `JWT_ACCESS_SECRET` aleatório e fica fora do git.',
+          '- Em um clone novo, copie `.env.example` para `.env` e gere o segredo com `openssl rand -base64 32`.',
+        ]),
     `- ${usesPostgres(answers) ? 'Se PostgreSQL estiver habilitado, suba o banco antes do `dev`.' : 'Revise o `.env` antes do primeiro `dev`.'}`,
     '',
     'Estrutura inicial pronta para produção com:',
     '- Clean architecture (`domain`, `application`, `infra`, `presentation`)',
     '- Validação de payload e de ambiente',
-    '- JWT para autenticação e proteção de rotas',
+    withFirebase
+      ? '- Firebase Auth: o backend verifica o ID token enviado pelo frontend'
+      : '- JWT para autenticação e proteção de rotas',
     `- ORM/persistência: ${ormLabel}`,
     '',
     '## Recursos habilitados',
     `- Persistência do backend: ${backendDataLayer}`,
     `- PostgreSQL: ${usesPostgres(answers) ? 'sim' : 'não'}`,
-    '- Estratégia de auth do backend: JWT próprio',
+    `- Estratégia de auth do backend: ${withFirebase ? 'Firebase Auth' : 'JWT próprio'}`,
     '',
+    ...(withFirebase
+      ? [
+          '## Firebase Auth',
+          '- O frontend faz login com o SDK do Firebase e envia `Authorization: Bearer <ID token>`.',
+          '- O backend só verifica o token. Cadastro, login e senha ficam no Firebase.',
+          '- `GET /api/users/me` cria o usuário local (id = UID do Firebase) no primeiro acesso.',
+          answers.backend === 'fastapi'
+            ? '- O SDK Python exige credencial para verificar token: aponte `GOOGLE_APPLICATION_CREDENTIALS` para a service account (Console > Configurações do projeto > Contas de serviço) ou rode no GCP.'
+            : '- Verificar token só precisa do `FIREBASE_PROJECT_ID`. Service account só é necessária para operações de admin (custom claims, criar usuário).',
+          '- Dev local sem projeto real: na raiz, `firebase emulators:start --only auth --project demo-app`, com `FIREBASE_PROJECT_ID=demo-app` e `FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099` no `.env`.',
+          '',
+        ]
+      : []),
     '## Como rodar',
     ...runInstructions,
     '',
     '## Endpoints iniciais',
-    '- `GET /api/health`',
-    '- `POST /api/auth/register`',
-    '- `POST /api/auth/login`',
+    ...healthEndpoints,
+    ...(withFirebase ? [] : ['- `POST /api/auth/register`', '- `POST /api/auth/login`']),
     '- `GET /api/users/me`',
   ]
 
   if (usesPostgres(answers)) {
     sections.push('- Garanta que o PostgreSQL esteja disponível em `DATABASE_URL` antes de subir a aplicação.')
-
-    if (answers.useDocker && answers.provisionPostgres) {
-      sections.push('- Se você escolheu Docker no scaffold, suba a infra com `docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env up -d`.')
-    }
   }
 
-  if (answers.useDocker && (answers.provisionPostgres || answers.useRedis)) {
+  if (answers.provisionPostgres) {
     sections.push(
       '',
       '## Infra local',
-      'Para subir PostgreSQL e Redis a partir de `apps/backend`, use:',
+      'Para subir o PostgreSQL a partir de `apps/backend`, use:',
       '',
       '```bash',
-      'docker compose -f ../../infra/docker/docker-compose.yml --env-file ../../infra/docker/.env up -d',
+      'docker compose -f ../../infra/docker/docker-compose.yml up -d',
       '```',
       '',
       'Para derrubar a infraestrutura:',
@@ -93,32 +149,53 @@ function getBackendReadme(
   sections.push(
     '',
     '## Próximo passo recomendado',
-    '- Adicionar refresh token, autorização por papéis e testes de integração.',
+    withFirebase
+      ? '- Usar custom claims do Firebase para papéis e adicionar testes de integração.'
+      : '- Adicionar refresh token, autorização por papéis e testes de integração.',
   )
 
   return `${sections.join('\n')}\n`
 }
 
-function getRuntimeConfigTs(
-  framework: 'express' | 'nestjs',
-  withPostgres: boolean,
-) {
-  return `export const runtimeConfig = {
-  framework: '${framework}',
-  authStrategy: 'jwt',
-  persistence: '${withPostgres ? 'postgres' : 'memory'}',
-  orm: '${withPostgres ? 'prisma' : 'memory'}',
-} as const
+// O contexto do build é a raiz do monorepo: o pnpm-lock.yaml fica lá
+function getNodeDockerfile(withPostgres: boolean) {
+  return `# Build a partir da raiz: docker build -f apps/backend/Dockerfile .
+FROM node:24-slim AS base
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+RUN corepack enable
+${withPostgres ? '# Prisma precisa do OpenSSL\nRUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*\n' : ''}
+FROM base AS build
+WORKDIR /repo
+COPY . .
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN pnpm --filter @apps/backend build
+# Cópia isolada do app só com as dependências de produção
+RUN pnpm --filter @apps/backend deploy --prod /prod/backend
+${withPostgres ? '# O deploy não roda o postinstall: gera o Prisma Client na cópia\nRUN cd /prod/backend && node_modules/.bin/prisma generate\n' : ''}
+FROM base
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /prod/backend .
+USER node
+EXPOSE 3001
+${withPostgres ? '# Aplica as migrations commitadas em prisma/migrations antes de subir\nCMD ["sh", "-c", "node_modules/.bin/prisma migrate deploy && exec node dist/main.js"]' : 'CMD ["node", "dist/main.js"]'}
 `
 }
 
-function getRuntimeConfigPy(withPostgres: boolean) {
-  return `RUNTIME_CONFIG = {
-    'framework': 'fastapi',
-    'auth_strategy': 'jwt',
-    'persistence': '${withPostgres ? 'postgres' : 'memory'}',
-    'orm': '${withPostgres ? 'sqlalchemy' : 'memory'}',
-}
+function getFastApiDockerfile() {
+  return `# Build a partir da raiz: docker build -f apps/backend/Dockerfile .
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY apps/backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY apps/backend/app ./app
+RUN useradd --system app
+USER app
+EXPOSE 3001
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \${PORT:-3001}"]
 `
 }
 
@@ -145,6 +222,7 @@ model User {
 export function createExpress(projectDir: string, answers: Answers) {
   const backendDir = path.join(projectDir, 'apps', 'backend')
   const withPostgres = usesPostgres(answers)
+  const withFirebase = answers.auth === 'firebase'
 
   const packageJson = {
     name: '@apps/backend',
@@ -164,25 +242,26 @@ export function createExpress(projectDir: string, answers: Answers) {
         : {}),
     },
     dependencies: {
-      bcryptjs: '^2.4.3',
+      ...(withFirebase
+        ? { 'firebase-admin': '^14.5.0' }
+        : { bcryptjs: '^2.4.3', jose: '^5.9.6' }),
       cors: '^2.8.5',
       dotenv: '^16.4.7',
       express: '^4.21.2',
       helmet: '^8.0.0',
-      jose: '^5.9.6',
       'pino-http': '^10.3.0',
       'pino-pretty': '^13.0.0',
       'reflect-metadata': '^0.2.2',
       tsyringe: '^4.8.0',
       zod: '^3.24.1',
-      ...(withPostgres ? { '@prisma/client': '^6.4.1' } : {}),
+      // prisma em dependencies: o container roda prisma migrate deploy
+      ...(withPostgres ? { '@prisma/client': '^6.4.1', prisma: '^6.4.1' } : {}),
     },
     devDependencies: {
-      '@types/bcryptjs': '^2.4.6',
+      ...(withFirebase ? {} : { '@types/bcryptjs': '^2.4.6' }),
       '@types/cors': '^2.8.17',
-      '@types/express': '^5.0.0',
+      '@types/express': '^4.17.21',
       '@types/node': '^22.10.2',
-      prisma: '^6.4.1',
       tsx: '^4.19.2',
       typescript: '^5.7.2',
     },
@@ -215,15 +294,14 @@ export function createExpress(projectDir: string, answers: Answers) {
   )
 
   createFiles(backendDir, {
-    '.env.example': getBackendEnvExample(answers),
-    'src/shared/config/runtime.ts': getRuntimeConfigTs('express', withPostgres),
+    ...getBackendEnvFiles(answers),
+    Dockerfile: getNodeDockerfile(withPostgres),
     'src/main.ts': `import 'reflect-metadata'
 import 'dotenv/config'
 import { createApp } from './app.js'
 import { buildHttpDependencies } from './infra/container/build-http-dependencies.js'
-import { assertEnvFileExists, loadEnv } from './shared/config/env.js'
+import { loadEnv } from './shared/config/env.js'
 
-assertEnvFileExists()
 const env = loadEnv()
 const dependencies = buildHttpDependencies(env)
 const app = createApp(env, dependencies.router)
@@ -237,7 +315,7 @@ app.listen(env.PORT, () => {
     'src/app.ts': `import express, { type Router } from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
-import pinoHttp from 'pino-http'
+import { pinoHttp } from 'pino-http'
 import { errorHandler } from './presentation/http/middlewares/error-handler.js'
 import type { AppEnv } from './shared/config/env.js'
 
@@ -267,8 +345,7 @@ export function createApp(env: AppEnv, apiRouter: Router) {
   return app
 }
 `,
-    'src/shared/config/env.ts': `import fs from 'node:fs'
-import { z } from 'zod'
+    'src/shared/config/env.ts': `import { z } from 'zod'
 
 const envSchema = z
   .object({
@@ -280,29 +357,17 @@ const envSchema = z
       .string()
       .default('http://localhost:3000,http://localhost:5173')
       .transform((value) => value.split(',').map((item) => item.trim()).filter(Boolean)),
-    DATABASE_URL: z.string().optional(),
-    JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.'),
+    DATABASE_URL: ${withPostgres ? "z.string().min(1, 'DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')" : 'z.string().optional()'},
+${withFirebase ? `    FIREBASE_PROJECT_ID: z
+      .string({ required_error: 'FIREBASE_PROJECT_ID é obrigatório (Console do Firebase > Configurações do projeto).' })
+      .min(1, 'FIREBASE_PROJECT_ID é obrigatório (Console do Firebase > Configurações do projeto).'),
+` : `    JWT_ACCESS_SECRET: z
+      .string({ required_error: 'JWT_ACCESS_SECRET é obrigatório (gere com: openssl rand -base64 32).' })
+      .min(32, 'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres (gere com: openssl rand -base64 32).'),
     JWT_ACCESS_EXPIRES_IN: z.string().min(2).default('1d'),
-  })
-  .superRefine((value, ctx) => {
-    if (${withPostgres} && !value.DATABASE_URL) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['DATABASE_URL'],
-        message: 'DATABASE_URL é obrigatória quando PostgreSQL está habilitado.',
-      })
-    }
-  })
+`}  })
 
 export type AppEnv = z.infer<typeof envSchema>
-
-export function assertEnvFileExists() {
-  if (!fs.existsSync('.env')) {
-    throw new Error(
-      'Arquivo .env não encontrado. Copie .env.example para .env antes de rodar o backend.',
-    )
-  }
-}
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   const parsedEnv = envSchema.safeParse(source)
@@ -331,9 +396,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
 `,
     'src/@types/express/index.d.ts': `declare namespace Express {
   interface Request {
-    auth?: {
-      userId: string
-    }
+    auth?: import('../../application/security/contracts/token-service.contract.js').AccessTokenPayload
   }
 }
 `,
@@ -835,24 +898,16 @@ export function createAuthMiddleware(tokenService: TokenServiceContract) {
     const token = authorization.replace('Bearer ', '').trim()
     const payload = await tokenService.verifyAccessToken(token)
 
-    req.auth = { userId: payload.sub }
+    req.auth = payload
     next()
   }
 }
 `,
     'src/presentation/http/controllers/health.controller.ts': `import type { Request, Response } from 'express'
-import { runtimeConfig } from '../../../shared/config/runtime.js'
 
 export class HealthController {
   handle(_req: Request, res: Response) {
-    return res.json({
-      status: 'ok',
-      framework: runtimeConfig.framework,
-      authStrategy: runtimeConfig.authStrategy,
-      persistence: runtimeConfig.persistence,
-      orm: runtimeConfig.orm,
-      timestamp: new Date().toISOString(),
-    })
+    return res.json({ status: 'ok', timestamp: new Date().toISOString() })
   }
 }
 `,
@@ -884,7 +939,7 @@ export class UsersController {
   constructor(private readonly getCurrentUserUseCase: GetCurrentUserUseCase) {}
 
   async me(req: Request, res: Response) {
-    const result = await this.getCurrentUserUseCase.execute(req.auth!.userId)
+    const result = await this.getCurrentUserUseCase.execute(req.auth!.sub)
     return res.status(200).json(result)
   }
 }
@@ -939,29 +994,30 @@ export function createApiRouter({
       answers,
       [
         '```bash',
-        'cp .env.example .env',
         'pnpm install',
-        ...(withPostgres ? ['pnpm db:generate', 'pnpm db:migrate'] : []),
+        ...(withPostgres ? ['pnpm db:migrate'] : []),
         'pnpm dev',
         '```',
       ],
     ),
-  })
+  }, withFirebase ? expressFirebaseOverlay(answers) : {})
 }
 
 export function createNest(projectDir: string, answers: Answers) {
   const backendDir = path.join(projectDir, 'apps', 'backend')
   const withPostgres = usesPostgres(answers)
+  const withFirebase = answers.auth === 'firebase'
 
   const packageJson = {
     name: '@apps/backend',
     private: true,
     type: 'module',
+    // Nest depende de emitDecoratorMetadata: tsx/esbuild não emite, então dev e test usam tsc
     scripts: {
-      dev: 'tsx watch src/main.ts',
+      dev: 'tsc-watch -p tsconfig.json --onSuccess "node dist/main.js"',
       build: 'tsc -p tsconfig.json',
       start: 'node dist/main.js',
-      test: 'tsx --test src/**/*.test.ts',
+      test: 'tsc -p tsconfig.json && node --test "dist/**/*.test.js"',
       ...(withPostgres
         ? {
             postinstall: 'prisma generate',
@@ -974,25 +1030,26 @@ export function createNest(projectDir: string, answers: Answers) {
       '@nestjs/common': '^11.0.3',
       '@nestjs/core': '^11.0.3',
       '@nestjs/platform-express': '^11.0.3',
-      bcryptjs: '^2.4.3',
+      ...(withFirebase
+        ? { 'firebase-admin': '^14.5.0' }
+        : { bcryptjs: '^2.4.3', jose: '^5.9.6' }),
       'class-transformer': '^0.5.1',
       'class-validator': '^0.14.1',
       dotenv: '^16.4.7',
       helmet: '^8.0.0',
-      jose: '^5.9.6',
       'reflect-metadata': '^0.2.2',
       rxjs: '^7.8.1',
-      ...(withPostgres ? { '@prisma/client': '^6.4.1' } : {}),
+      // prisma em dependencies: o container roda prisma migrate deploy
+      ...(withPostgres ? { '@prisma/client': '^6.4.1', prisma: '^6.4.1' } : {}),
     },
     devDependencies: {
       '@nestjs/testing': '^11.0.3',
-      '@types/bcryptjs': '^2.4.6',
+      ...(withFirebase ? {} : { '@types/bcryptjs': '^2.4.6' }),
       '@types/express': '^5.0.0',
       '@types/node': '^22.10.2',
       '@types/supertest': '^6.0.3',
-      ...(withPostgres ? { prisma: '^6.4.1' } : {}),
       supertest: '^7.1.0',
-      tsx: '^4.19.2',
+      'tsc-watch': '^7.2.1',
       typescript: '^5.7.2',
     },
   }
@@ -1023,8 +1080,8 @@ export function createNest(projectDir: string, answers: Answers) {
   )
 
   createFiles(backendDir, {
-    '.env.example': getBackendEnvExample(answers),
-    'src/shared/config/runtime.ts': getRuntimeConfigTs('nestjs', withPostgres),
+    ...getBackendEnvFiles(answers),
+    Dockerfile: getNodeDockerfile(withPostgres),
     'src/bootstrap/configure-app.ts': `import helmet from 'helmet'
 import { ValidationPipe, type INestApplication } from '@nestjs/common'
 import { AppExceptionFilter } from '../presentation/http/filters/app-exception.filter.js'
@@ -1075,8 +1132,7 @@ bootstrap()
   appName: string
   corsOrigin: string[]
   databaseUrl?: string
-  jwtAccessSecret: string
-  jwtAccessExpiresIn: string
+${withFirebase ? '  firebaseProjectId: string' : '  jwtAccessSecret: string\n  jwtAccessExpiresIn: string'}
 }
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -1087,17 +1143,23 @@ function assert(condition: unknown, message: string): asserts condition {
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const port = Number(source.PORT ?? 3001)
-  const jwtAccessSecret =
-    source.JWT_ACCESS_SECRET ?? 'change-this-secret-with-at-least-32-characters'
+${withFirebase ? `  const firebaseProjectId = source.FIREBASE_PROJECT_ID ?? ''
 
   assert(Number.isFinite(port) && port > 0, 'PORT deve ser um número válido.')
-  assert(jwtAccessSecret.length >= 32, 'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.')
+  assert(
+    firebaseProjectId,
+    'FIREBASE_PROJECT_ID é obrigatório (Console do Firebase > Configurações do projeto).',
+  )
+` : `  const jwtAccessSecret = source.JWT_ACCESS_SECRET ?? ''
 
+  assert(Number.isFinite(port) && port > 0, 'PORT deve ser um número válido.')
+  assert(
+    jwtAccessSecret.length >= 32,
+    'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres (gere com: openssl rand -base64 32).',
+  )
+`}
   const databaseUrl = source.DATABASE_URL
-  if (${withPostgres} && !databaseUrl) {
-    throw new Error('DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')
-  }
-
+${withPostgres ? "  assert(databaseUrl, 'DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')\n" : ''}
   return {
     port,
     globalPrefix: source.GLOBAL_PREFIX ?? 'api',
@@ -1108,8 +1170,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
       .map((item) => item.trim())
       .filter(Boolean),
     databaseUrl,
-    jwtAccessSecret,
-    jwtAccessExpiresIn: source.JWT_ACCESS_EXPIRES_IN ?? '1d',
+${withFirebase ? '    firebaseProjectId,' : "    jwtAccessSecret,\n    jwtAccessExpiresIn: source.JWT_ACCESS_EXPIRES_IN ?? '1d',"}
   }
 }
 `,
@@ -1445,7 +1506,6 @@ export class PrismaUserRepository implements UserRepositoryContract {
         }
       : {}),
     'src/infra/modules/persistence.module.ts': `import { Module } from '@nestjs/common'
-import { UserRepositoryContract } from '../../domain/users/contracts/user-repository.contract.js'
 ${withPostgres ? "import { PrismaUserRepository } from '../repositories/prisma-user.repository.js'" : "import { InMemoryUserRepository } from '../repositories/in-memory-user.repository.js'"}
 
 @Module({
@@ -1460,8 +1520,6 @@ ${withPostgres ? "import { PrismaUserRepository } from '../repositories/prisma-u
 export class PersistenceModule {}
 `,
     'src/infra/modules/security.module.ts': `import { Module } from '@nestjs/common'
-import { PasswordHasherContract } from '../../application/security/contracts/password-hasher.contract.js'
-import { TokenServiceContract } from '../../application/security/contracts/token-service.contract.js'
 import { BcryptPasswordHasher } from '../security/bcrypt-password-hasher.js'
 import { JwtTokenService } from '../security/jwt-token.service.js'
 
@@ -1557,20 +1615,12 @@ export class JwtAuthGuard implements CanActivate {
 }
 `,
     'src/presentation/http/controllers/health.controller.ts': `import { Controller, Get } from '@nestjs/common'
-import { runtimeConfig } from '../../../shared/config/runtime.js'
 
 @Controller('health')
 export class HealthController {
   @Get()
   handle() {
-    return {
-      status: 'ok',
-      framework: runtimeConfig.framework,
-      authStrategy: runtimeConfig.authStrategy,
-      persistence: runtimeConfig.persistence,
-      orm: runtimeConfig.orm,
-      timestamp: new Date().toISOString(),
-    }
+    return { status: 'ok', timestamp: new Date().toISOString() }
   }
 }
 `,
@@ -1610,7 +1660,7 @@ import { JwtAuthGuard } from '../../presentation/http/guards/jwt-auth.guard.js'
 })
 export class UsersModule {}
 `,
-    'src/presentation/http/controllers/auth.controller.ts': `import { Body, Controller, Post } from '@nestjs/common'
+    'src/presentation/http/controllers/auth.controller.ts': `import { Body, Controller, HttpCode, Post } from '@nestjs/common'
 import { LoginUseCase } from '../../../application/auth/use-cases/login.use-case.js'
 import { RegisterUserUseCase } from '../../../application/users/use-cases/register-user.use-case.js'
 import { LoginDto } from '../dto/login.dto.js'
@@ -1629,6 +1679,7 @@ export class AuthController {
   }
 
   @Post('login')
+  @HttpCode(200)
   login(@Body() body: LoginDto) {
     return this.loginUseCase.execute(body)
   }
@@ -1659,6 +1710,9 @@ import { configureApp } from './bootstrap/configure-app.js'
 import { AppModule } from './app.module.js'
 import { loadEnv } from './shared/config/env.js'
 
+// ||= e não ??=: o Prisma carrega o .env no import e uma variável vazia não conta
+${withFirebase ? "process.env.FIREBASE_PROJECT_ID ||= 'demo-test'" : "process.env.JWT_ACCESS_SECRET ||= 'test-secret-with-at-least-32-characters'"}
+${withPostgres ? "process.env.DATABASE_URL ||= 'postgresql://postgres:postgres@localhost:5432/app_db'\n" : ''}
 describe('Health', () => {
   let app: INestApplication
 
@@ -1668,15 +1722,7 @@ describe('Health', () => {
     }).compile()
 
     app = moduleRef.createNestApplication()
-    configureApp(
-      app,
-      loadEnv({
-        ...process.env,
-        ${withPostgres ? "DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/app_db'," : ''}
-        JWT_ACCESS_SECRET:
-          process.env.JWT_ACCESS_SECRET ?? 'change-this-secret-with-at-least-32-characters',
-      }),
-    )
+    configureApp(app, loadEnv())
     await app.init()
   })
 
@@ -1698,45 +1744,32 @@ describe('Health', () => {
       answers,
       [
         '```bash',
-        'cp .env.example .env',
         'pnpm install',
-        ...(withPostgres ? ['pnpm db:generate', 'pnpm db:migrate'] : []),
+        ...(withPostgres ? ['pnpm db:migrate'] : []),
         'pnpm test',
         'pnpm dev',
         '```',
       ],
     ),
-  })
+  }, withFirebase ? nestFirebaseOverlay(answers) : {})
 }
 
 export function createFastApi(projectDir: string, answers: Answers) {
   const backendDir = path.join(projectDir, 'apps', 'backend')
   const withPostgres = usesPostgres(answers)
-  const fastApiEnvExample = [
-    'PORT=3001',
-    'API_PREFIX=api',
-    'ENVIRONMENT=development',
-    'APP_NAME=Create Stack API',
-    'CORS_ORIGINS=http://localhost:3000,http://localhost:5173',
-    'LOG_LEVEL=INFO',
-    'JWT_ACCESS_SECRET=change-this-secret-with-at-least-32-characters',
-    'JWT_ACCESS_EXPIRES_MINUTES=1440',
-    ...(withPostgres
-      ? ['DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app_db']
-      : []),
-  ].join('\n')
-
+  const withFirebase = answers.auth === 'firebase'
+  // ponytail: pins exatos testados juntos; atualize de propósito, não por acidente
   writeFile(
     path.join(backendDir, 'requirements.txt'),
     `${[
-      'fastapi',
-      'uvicorn[standard]',
-      'pydantic-settings',
-      'python-dotenv',
-      'email-validator',
-      'passlib[bcrypt]',
-      'python-jose[cryptography]',
-      ...(withPostgres ? ['sqlalchemy', 'psycopg[binary]'] : []),
+      'fastapi==0.143.1',
+      'uvicorn[standard]==0.54.0',
+      'pydantic-settings==2.16.0',
+      'email-validator==2.3.0',
+      ...(withFirebase
+        ? ['firebase-admin==7.7.0', 'python-dotenv==1.2.4']
+        : ['bcrypt==5.0.0', 'pyjwt==2.15.1']),
+      ...(withPostgres ? ['sqlalchemy==2.1.4', 'psycopg[binary]==3.3.6'] : []),
     ].join('\n')}\n`,
   )
 
@@ -1744,26 +1777,51 @@ export function createFastApi(projectDir: string, answers: Answers) {
     path.join(backendDir, 'requirements-dev.txt'),
     `${[
       '-r requirements.txt',
-      'pytest',
-      'pytest-cov',
-      'httpx',
-      'ruff',
-      'mypy',
+      'pytest==9.1.1',
+      'pytest-cov==7.1.0',
+      'httpx==0.28.1',
+      'ruff==0.17.0',
+      'mypy==2.4.0',
     ].join('\n')}\n`,
   )
 
   createFiles(backendDir, {
-    '.env.example': `${fastApiEnvExample}\n`,
-    'pyproject.toml': `[tool.pytest.ini_options]
+    Dockerfile: getFastApiDockerfile(),
+    ...withEnvFiles((secret) => [
+      'PORT=3001',
+      'API_PREFIX=api',
+      'ENVIRONMENT=development',
+      'APP_NAME=Create Stack API',
+      'CORS_ORIGINS=http://localhost:3000,http://localhost:5173',
+      'LOG_LEVEL=INFO',
+      ...(withFirebase
+        ? getFirebaseEnvLines(answers)
+        : [
+            '# Gere com: openssl rand -base64 32',
+            `JWT_ACCESS_SECRET=${secret}`,
+            'JWT_ACCESS_EXPIRES_MINUTES=1440',
+          ]),
+      ...(withPostgres
+        ? ['DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app_db']
+        : []),
+    ]),
+    'pyproject.toml': `[project]
+name = "backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -1794,7 +1852,6 @@ typecheck:
 app = create_app()
 `,
     'app/bootstrap/__init__.py': '',
-    'app/bootstrap/runtime.py': getRuntimeConfigPy(withPostgres),
     'app/bootstrap/logging.py': `import logging
 
 
@@ -1810,12 +1867,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.bootstrap.container import AppContainer
-
+${withPostgres ? 'from app.infra.database.base import Base\n' : ''}
 
 def create_lifespan(container: AppContainer):
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        yield
+${withPostgres ? `        # ponytail: create_all só cria tabelas novas; adote Alembic quando o schema evoluir
+        Base.metadata.create_all(container.engine)
+` : ''}        yield
         container.shutdown()
 
     return lifespan
@@ -1825,34 +1884,27 @@ def create_lifespan(container: AppContainer):
 from dataclasses import dataclass
 from typing import Any
 
-from app.application.auth.use_cases.login import LoginUseCase
-from app.application.security.password_hasher_contract import PasswordHasherContract
-from app.application.security.token_service_contract import TokenServiceContract
+${withFirebase ? '' : 'from app.application.auth.use_cases.login import LoginUseCase\nfrom app.application.security.password_hasher_contract import PasswordHasherContract\n'}from app.application.security.token_service_contract import TokenServiceContract
 from app.application.users.use_cases.get_current_user import GetCurrentUserUseCase
-from app.application.users.use_cases.register_user import RegisterUserUseCase
-from app.domain.users.contracts.user_repository import UserRepositoryContract
+${withFirebase ? '' : 'from app.application.users.use_cases.register_user import RegisterUserUseCase\n'}from app.domain.users.contracts.user_repository import UserRepositoryContract
 from app.infra.config.settings import Settings
-${withPostgres ? "from app.infra.database.session import create_database_runtime\nfrom app.infra.observability.readiness import MemoryReadinessProbe, SqlAlchemyReadinessProbe\nfrom app.infra.repositories.sqlalchemy.user_repository import SqlAlchemyUserRepository" : "from app.infra.observability.readiness import MemoryReadinessProbe\nfrom app.infra.repositories.memory.user_repository import InMemoryUserRepository"}
-from app.infra.security.jwt_token_service import JwtTokenService
-from app.infra.security.password_hasher import BcryptPasswordHasher
+${withPostgres ? "from app.infra.database.session import create_database_runtime\nfrom app.infra.observability.readiness import SqlAlchemyReadinessProbe\nfrom app.infra.repositories.sqlalchemy.user_repository import SqlAlchemyUserRepository" : "from app.infra.observability.readiness import MemoryReadinessProbe\nfrom app.infra.repositories.memory.user_repository import InMemoryUserRepository"}
+${withFirebase ? 'from app.infra.security.firebase_token_service import FirebaseTokenService' : 'from app.infra.security.jwt_token_service import JwtTokenService\nfrom app.infra.security.password_hasher import BcryptPasswordHasher'}
 
 
 @dataclass(slots=True)
 class AppContainer:
     settings: Settings
-    password_hasher: PasswordHasherContract
-    token_service: TokenServiceContract
+${withFirebase ? '' : '    password_hasher: PasswordHasherContract\n'}    token_service: TokenServiceContract
     readiness_probe: Any
     session_factory: Any = None
     engine: Any = None
 
     def build_user_repository(self, db_session: Any | None = None) -> UserRepositoryContract:
-        if self.settings.data_layer == 'postgres':
-            if db_session is None:
-                raise RuntimeError('Uma sessão de banco é obrigatória quando data_layer=postgres.')
-            return SqlAlchemyUserRepository(db_session)
-        return InMemoryUserRepository()
-
+${withPostgres ? `        if db_session is None:
+            raise RuntimeError('Uma sessão de banco é obrigatória com PostgreSQL.')
+        return SqlAlchemyUserRepository(db_session)` : '        return InMemoryUserRepository()'}
+${withFirebase ? '' : `
     def build_register_user_use_case(self, db_session: Any | None = None) -> RegisterUserUseCase:
         return RegisterUserUseCase(
             self.build_user_repository(db_session),
@@ -1865,8 +1917,10 @@ class AppContainer:
             self.password_hasher,
             self.token_service,
         )
-
-    def build_get_current_user_use_case(self, db_session: Any | None = None) -> GetCurrentUserUseCase:
+`}
+    def build_get_current_user_use_case(
+        self, db_session: Any | None = None
+    ) -> GetCurrentUserUseCase:
         return GetCurrentUserUseCase(self.build_user_repository(db_session))
 
     def shutdown(self) -> None:
@@ -1875,27 +1929,24 @@ class AppContainer:
 
 
 def build_container(settings: Settings) -> AppContainer:
-    password_hasher = BcryptPasswordHasher()
-    token_service = JwtTokenService(settings)
+${withFirebase ? '' : '    password_hasher = BcryptPasswordHasher()\n'}    token_service = ${withFirebase ? 'FirebaseTokenService' : 'JwtTokenService'}(settings)
 
 ${withPostgres ? `    engine, session_factory = create_database_runtime(settings)
     readiness_probe = SqlAlchemyReadinessProbe(session_factory)
     return AppContainer(
         settings=settings,
-        password_hasher=password_hasher,
-        token_service=token_service,
+${withFirebase ? '' : '        password_hasher=password_hasher,\n'}        token_service=token_service,
         readiness_probe=readiness_probe,
         session_factory=session_factory,
         engine=engine,
     )` : `    readiness_probe = MemoryReadinessProbe()
     return AppContainer(
         settings=settings,
-        password_hasher=password_hasher,
-        token_service=token_service,
+${withFirebase ? '' : '        password_hasher=password_hasher,\n'}        token_service=token_service,
         readiness_probe=readiness_probe,
     )`}
 `,
-    'app/bootstrap/app_factory.py': `from fastapi import FastAPI
+    'app/bootstrap/app_factory.py': `${withFirebase ? 'from dotenv import load_dotenv\n' : ''}from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.bootstrap.container import build_container
@@ -1907,7 +1958,7 @@ from app.presentation.http.errors.handlers import register_exception_handlers
 
 
 def create_app() -> FastAPI:
-    settings = get_settings()
+${withFirebase ? '    # Exporta o .env para o ambiente: o SDK do Firebase lê\n    # GOOGLE_APPLICATION_CREDENTIALS e FIREBASE_AUTH_EMULATOR_HOST de lá\n    load_dotenv()\n' : ''}    settings = get_settings()
     configure_logging(settings.log_level)
     container = build_container(settings)
 
@@ -1994,20 +2045,6 @@ class LoginUseCase:
                 created_at=user.created_at,
             ),
         )
-`,
-    'app/application/common/__init__.py': '',
-    'app/application/common/contracts/__init__.py': '',
-    'app/application/common/contracts/unit_of_work.py': `from abc import ABC, abstractmethod
-
-
-class UnitOfWorkContract(ABC):
-    @abstractmethod
-    def commit(self) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def rollback(self) -> None:
-        raise NotImplementedError
 `,
     'app/application/security/__init__.py': '',
     'app/application/security/password_hasher_contract.py': `from abc import ABC, abstractmethod
@@ -2145,18 +2182,6 @@ class UserEntity:
     password_hash: str
     created_at: str
 `,
-    'app/domain/users/value_objects/__init__.py': '',
-    'app/domain/users/value_objects/email.py': `from dataclasses import dataclass
-
-
-@dataclass(frozen=True, slots=True)
-class Email:
-    value: str
-
-    def __post_init__(self):
-        if '@' not in self.value:
-            raise ValueError('E-mail inválido.')
-`,
     'app/infra/__init__.py': '',
     'app/infra/config/__init__.py': '',
     'app/infra/config/settings.py': `from functools import lru_cache
@@ -2172,12 +2197,7 @@ class Settings(BaseSettings):
     port: int = 3001
     log_level: str = 'INFO'
     cors_origins: str = 'http://localhost:3000,http://localhost:5173'
-    data_layer: str = '${withPostgres ? 'postgres' : 'memory'}'
-    auth_strategy: str = 'jwt'
-    database_url: str | None = None
-    jwt_access_secret: str = 'change-this-secret-with-at-least-32-characters'
-    jwt_access_expires_minutes: int = 1440
-
+${withPostgres ? '    database_url: str\n' : ''}${withFirebase ? '    firebase_project_id: str\n' : '    jwt_access_secret: str\n    jwt_access_expires_minutes: int = 1440\n'}
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 
     @field_validator('log_level')
@@ -2195,18 +2215,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def validate_dependencies(self):
-        if self.data_layer not in {'memory', 'postgres'}:
-            raise ValueError('DATA_LAYER inválido.')
-
-        if ${withPostgres ? 'True' : 'False'} and not self.database_url:
-            raise ValueError('DATABASE_URL é obrigatória quando PostgreSQL está habilitado.')
-
-        if len(self.jwt_access_secret) < 32:
-            raise ValueError('JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres.')
+${withFirebase ? `        if not self.firebase_project_id:
+            raise ValueError(
+                'FIREBASE_PROJECT_ID é obrigatório '
+                '(Console do Firebase > Configurações do projeto).'
+            )
+` : `        if len(self.jwt_access_secret) < 32:
+            raise ValueError(
+                'JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres '
+                '(gere com: openssl rand -base64 32).'
+            )
 
         if self.jwt_access_expires_minutes <= 0:
             raise ValueError('JWT_ACCESS_EXPIRES_MINUTES deve ser maior que zero.')
-
+`}
         return self
 
 
@@ -2241,7 +2263,7 @@ def create_database_runtime(settings: Settings):
     return engine, session_factory
 `,
           'app/infra/database/models/__init__.py': '',
-          'app/infra/database/models/user_model.py': `from datetime import datetime
+          'app/infra/database/models/user_model.py': `from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import DateTime, String
@@ -2257,14 +2279,22 @@ class UserModel(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
 `,
-          'app/infra/database/migrations/README.md': `Use Alembic para versionar o schema deste backend.
+          'app/infra/database/README.md': `As tabelas são criadas no startup via \`Base.metadata.create_all\` (ver \`app/bootstrap/lifespan.py\`).
 
-Sugestão:
-- alembic init app/infra/database/migrations
-- alembic revision --autogenerate -m "init"
-- alembic upgrade head
+Quando o schema começar a evoluir, adote Alembic:
+
+\`\`\`bash
+pip install alembic
+alembic init migrations
+alembic revision --autogenerate -m "init"
+alembic upgrade head
+\`\`\`
+
+Depois remova o \`create_all\` do lifespan.
 `,
         }
       : {
@@ -2272,9 +2302,7 @@ Sugestão:
         }),
     'app/infra/observability/__init__.py': '',
     'app/infra/observability/readiness.py': `from dataclasses import dataclass
-
-${withPostgres ? 'from sqlalchemy import text\n' : ''}
-
+${withPostgres ? '\nfrom sqlalchemy import text\n' : ''}
 
 @dataclass(slots=True)
 class ReadinessStatus:
@@ -2285,9 +2313,9 @@ class ReadinessStatus:
 class MemoryReadinessProbe:
     def check(self) -> ReadinessStatus:
         return ReadinessStatus(ok=True, detail='memory-ready')
+${withPostgres ? `
 
-
-${withPostgres ? `class SqlAlchemyReadinessProbe:
+class SqlAlchemyReadinessProbe:
     def __init__(self, session_factory):
         self.session_factory = session_factory
 
@@ -2298,8 +2326,7 @@ ${withPostgres ? `class SqlAlchemyReadinessProbe:
             return ReadinessStatus(ok=True, detail='postgres-ready')
         except Exception:
             return ReadinessStatus(ok=False, detail='postgres-unavailable')
-` : ''}
-`,
+` : ''}`,
     'app/infra/repositories/__init__.py': '',
     'app/infra/repositories/memory/__init__.py': '',
     'app/infra/repositories/memory/user_repository.py': `from datetime import datetime, timezone
@@ -2386,23 +2413,26 @@ class SqlAlchemyUserRepository(UserRepositoryContract):
 `,
         }
       : {}),
-    'app/infra/security/password_hasher.py': `from passlib.context import CryptContext
+    'app/infra/security/password_hasher.py': `import bcrypt
 
 from app.application.security.password_hasher_contract import PasswordHasherContract
 
-pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+
+def _to_bytes(value: str) -> bytes:
+    # bcrypt só usa os primeiros 72 bytes; o bcrypt>=5 lança erro em vez de truncar
+    return value.encode()[:72]
 
 
 class BcryptPasswordHasher(PasswordHasherContract):
     def hash(self, value: str) -> str:
-        return pwd_context.hash(value)
+        return bcrypt.hashpw(_to_bytes(value), bcrypt.gensalt()).decode()
 
     def compare(self, value: str, hashed_value: str) -> bool:
-        return pwd_context.verify(value, hashed_value)
+        return bcrypt.checkpw(_to_bytes(value), hashed_value.encode())
 `,
     'app/infra/security/jwt_token_service.py': `from datetime import datetime, timedelta, timezone
 
-from jose import JWTError, jwt
+import jwt
 
 from app.application.security.token_service_contract import TokenServiceContract
 from app.infra.config.settings import Settings
@@ -2429,8 +2459,10 @@ class JwtTokenService(TokenServiceContract):
     def verify_access_token(self, token: str) -> dict[str, str]:
         try:
             payload = jwt.decode(token, self.settings.jwt_access_secret, algorithms=['HS256'])
-        except JWTError as error:
-            raise AppError('Token inválido ou expirado.', status_code=401, code='INVALID_TOKEN') from error
+        except jwt.InvalidTokenError as error:
+            raise AppError(
+                'Token inválido ou expirado.', status_code=401, code='INVALID_TOKEN'
+            ) from error
 
         if 'sub' not in payload or 'email' not in payload:
             raise AppError('Token inválido.', status_code=401, code='INVALID_TOKEN')
@@ -2628,17 +2660,12 @@ class AuthResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    framework: str
-    auth_strategy: str
-    persistence: str
-    orm: str
     detail: str
 `,
     'app/presentation/http/routes/health.py': `from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
 from app.bootstrap.container import AppContainer
-from app.bootstrap.runtime import RUNTIME_CONFIG
 from app.presentation.http.dependencies.container import get_container
 from app.presentation.http.schemas.health import HealthResponse
 
@@ -2647,14 +2674,7 @@ router = APIRouter(prefix='/health', tags=['health'])
 
 @router.get('/live', response_model=HealthResponse)
 def live() -> HealthResponse:
-    return HealthResponse(
-        status='ok',
-        framework=RUNTIME_CONFIG['framework'],
-        auth_strategy=RUNTIME_CONFIG['auth_strategy'],
-        persistence=RUNTIME_CONFIG['persistence'],
-        orm=RUNTIME_CONFIG['orm'],
-        detail='process-alive',
-    )
+    return HealthResponse(status='ok', detail='process-alive')
 
 
 @router.get('/ready', response_model=HealthResponse)
@@ -2664,16 +2684,15 @@ def ready(
     readiness = container.readiness_probe.check()
     response = HealthResponse(
         status='ok' if readiness.ok else 'degraded',
-        framework=RUNTIME_CONFIG['framework'],
-        auth_strategy=RUNTIME_CONFIG['auth_strategy'],
-        persistence=RUNTIME_CONFIG['persistence'],
-        orm=RUNTIME_CONFIG['orm'],
         detail=readiness.detail,
     )
     if readiness.ok:
         return response
 
-    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=response.model_dump())
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=response.model_dump(),
+    )
 `,
     'app/presentation/http/routes/auth.py': `from fastapi import APIRouter, Depends, status
 
@@ -2685,7 +2704,12 @@ from app.presentation.http.dependencies.use_cases import (
     get_login_use_case,
     get_register_user_use_case,
 )
-from app.presentation.http.schemas.auth import AuthResponse, LoginBody, RegisterUserBody, UserResponse
+from app.presentation.http.schemas.auth import (
+    AuthResponse,
+    LoginBody,
+    RegisterUserBody,
+    UserResponse,
+)
 
 router = APIRouter(prefix='/auth', tags=['auth'])
 
@@ -2757,7 +2781,13 @@ def get_me(
     'app/shared/__init__.py': '',
     'app/shared/errors/__init__.py': '',
     'app/shared/errors/app_error.py': `class AppError(Exception):
-    def __init__(self, message: str, status_code: int = 400, code: str = 'APPLICATION_ERROR', details=None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        code: str = 'APPLICATION_ERROR',
+        details=None,
+    ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
@@ -2794,7 +2824,28 @@ def test_register_user_creates_a_new_user():
     assert result.email == 'antonio@example.com'
     assert result.name == 'Antonio'
 `,
-    'tests/e2e/test_health_live.py': `${withPostgres ? "import os\n\nos.environ.setdefault('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/app_db')\n\n" : ''}from fastapi.testclient import TestClient
+    'tests/conftest.py': `import os
+
+# Roda antes de importar o app: os testes não dependem do .env local
+${withFirebase ? "os.environ.setdefault('FIREBASE_PROJECT_ID', 'demo-test')" : "os.environ.setdefault('JWT_ACCESS_SECRET', 'test-secret-with-at-least-32-characters')"}
+${withPostgres ? "os.environ.setdefault('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/app_db')\n" : ''}`,
+    'tests/unit/test_password_hasher.py': `from app.infra.security.password_hasher import BcryptPasswordHasher
+
+
+def test_bcrypt_password_hasher_round_trip():
+    hasher = BcryptPasswordHasher()
+    hashed = hasher.hash('12345678')
+
+    assert hasher.compare('12345678', hashed)
+    assert not hasher.compare('wrong-password', hashed)
+
+
+def test_bcrypt_password_hasher_accepts_passwords_over_72_bytes():
+    hasher = BcryptPasswordHasher()
+
+    assert hasher.compare('é' * 100, hasher.hash('é' * 100))
+`,
+    'tests/e2e/test_health_live.py': `from fastapi.testclient import TestClient
 
 from app.main import app
 
@@ -2812,20 +2863,17 @@ def test_live_health_endpoint():
       answers,
       [
         '```bash',
-        'cp .env.example .env',
-        ...(withPostgres && answers.useDocker && answers.provisionPostgres
-          ? [
-              'cp ../../infra/docker/.env.example ../../infra/docker/.env',
-              'docker compose -f ../../infra/docker/docker-compose.yml --env-file ../../infra/docker/.env up -d',
-            ]
+        ...(answers.provisionPostgres
+          ? ['docker compose -f ../../infra/docker/docker-compose.yml up -d']
           : []),
-        'python3 -m venv .venv',
+        '# Requer Python >= 3.12',
+        'python3.12 -m venv .venv',
         'source .venv/bin/activate',
         'pip install -r requirements-dev.txt',
         'make test',
-        'uvicorn app.main:app --reload --port 3001',
+        'make dev',
         '```',
       ],
     ),
-  })
+  }, withFirebase ? fastApiFirebaseOverlay(answers) : {})
 }

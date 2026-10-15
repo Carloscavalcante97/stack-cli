@@ -1,6 +1,7 @@
 import { confirm, input, select } from '@inquirer/prompts'
 import {
   type Answers,
+  type AuthOption,
   type BackendOption,
   type DataLayerOption,
   type FrontendOption,
@@ -10,7 +11,10 @@ import {
 export async function askQuestions(): Promise<Answers> {
   const projectName = await input({
     message: 'Nome do projeto',
-    validate: (value) => (value.trim() ? true : 'Informe um nome'),
+    validate: (value) =>
+      /^[a-z0-9][a-z0-9._-]*$/.test(value)
+        ? true
+        : 'Use letras minúsculas, números, ".", "_" ou "-" (ex.: meu-app)',
   })
 
   const backend = await select<BackendOption>({
@@ -32,9 +36,31 @@ export async function askQuestions(): Promise<Answers> {
     ],
   })
 
-  const hasApplicationLayer = backend !== 'none' || frontend !== 'none'
+  const hasBackend = backend !== 'none'
 
-  const dataLayer = hasApplicationLayer
+  const auth =
+    hasBackend || frontend !== 'none'
+      ? await select<AuthOption>({
+          message: 'Escolha a autenticação',
+          choices: [
+            {
+              name: hasBackend ? 'JWT próprio' : 'Nenhuma',
+              value: 'jwt',
+              description: hasBackend
+                ? 'Cadastro, login e senha no backend'
+                : 'Frontend sem login',
+            },
+            {
+              name: 'Firebase Auth',
+              value: 'firebase',
+              description:
+                'Login no frontend com o SDK do Firebase; o backend só verifica o ID token',
+            },
+          ],
+        })
+      : 'jwt'
+
+  const dataLayer = hasBackend
     ? await select<DataLayerOption>({
         message: 'Escolha a persistência inicial do projeto',
         choices: [
@@ -57,33 +83,20 @@ export async function askQuestions(): Promise<Answers> {
     default: true,
   })
 
-  const useDocker = await confirm({
-    message: 'Deseja docker-compose para infraestrutura local?',
-    default: usesPostgres({ dataLayer }) || backend !== 'none',
-  })
-
-  const provisionPostgres = useDocker && usesPostgres({ dataLayer })
-    ? await confirm({
-        message: 'Provisionar PostgreSQL no docker-compose?',
-        default: true,
-      })
-    : false
-
-  const useRedis = useDocker && backend !== 'none'
-    ? await confirm({
-        message: 'Adicionar Redis no docker-compose?',
-        default: false,
-      })
-    : false
+  const provisionPostgres =
+    usesPostgres({ dataLayer }) &&
+    (await confirm({
+      message: 'Subir PostgreSQL local com docker-compose?',
+      default: true,
+    }))
 
   return {
     projectName,
     backend,
     frontend,
     dataLayer,
+    auth,
     useHusky,
-    useDocker,
     provisionPostgres,
-    useRedis,
   }
 }

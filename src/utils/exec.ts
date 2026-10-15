@@ -2,11 +2,7 @@ import { execSync } from 'node:child_process'
 import chalk from 'chalk'
 
 export function run(command: string, cwd: string) {
-  execSync(command, {
-    cwd,
-    stdio: 'inherit',
-    shell: '/bin/zsh',
-  })
+  execSync(command, { cwd, stdio: 'inherit' })
 }
 
 export function tryRun(command: string, cwd: string) {
